@@ -77,3 +77,51 @@ Remaining steps:
 The mini has 16 GB of RAM. The box is oversubscribed.
 Hermes needs about 400 MB to 700 MB for two Python processes.
 Free memory before you start Hermes. A reboot clears the swap and the accumulated leaks.
+
+## Patches on this branch
+
+Each patch carries a fix that is already open upstream. Delete the patch when
+upstream merges the fix.
+
+### 1. honcho_search returns nothing on a self-hosted Honcho server
+
+- File: `plugins/memory/honcho/session.py`, method `search_context`
+- Upstream issue: NousResearch/hermes-agent#79299
+- Related server bug: plastic-labs/honcho#940, fix PR #941 (still OPEN)
+
+**Symptom.** `honcho_search` always answers `No relevant context found.`, even
+when the same query against `POST /v3/workspaces/{id}/search` returns matches.
+The agent then reports that it has no memory.
+
+**Cause.** Two faults combine:
+
+1. `peer_perspective` is a temporal filter (`joined_at <= created_at <= left_at`).
+   Hermes calls `add_peers` on every process start when its cache misses. Honcho
+   server 3.0.12 and older resets `joined_at` to the current time when it re-adds
+   a member that is already active. All history before the last restart becomes
+   invisible.
+2. The fallback to peer-authored search fired only on an exception. An empty
+   HTTP 200 is not an exception, so the fallback never ran.
+
+**Fix.** Fall back to peer-authored search when the result is empty, not only
+when the call raises. Also log the resolved `peer_id`, because an unresolved
+peer and an empty history produced the same output.
+
+**Test.**
+
+```
+hermes -z Call honcho_search with query wiki dreaming deploy. Report the RAW tool output verbatim, nothing else.
+```
+
+Before the patch the result is `No relevant context found.`. After the patch the
+result is a list of message excerpts.
+
+**Do not upgrade the Honcho server to fix this.** The server fix is not merged.
+The bug is present in 3.0.11, 3.0.12, and `main`.
+
+### Known, not yet patched
+
+| Problem | Upstream |
+| --- | --- |
+| `saveMessages: false` is ignored, so messages are written anyway | #72708, #81214 |
+| No noise filtering before write (OpenClaw filters `NO_REPLY` and internal markers) | none found |

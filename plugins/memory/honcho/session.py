@@ -1427,6 +1427,8 @@ class HonchoSessionManager:
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
 
+        logger.debug("Honcho message search (resolved peer_perspective=%s)", peer_id)
+        messages = []
         try:
             messages = self._authed_call(
                 "message search",
@@ -1440,8 +1442,14 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
-            # Fall back to peer-authored search if the perspective filter is
-            # unsupported by the running Honcho version.
+
+        # ANYA-PATCH - upstream NousResearch/hermes-agent#79299.
+        # peer_perspective is a temporal filter (joined_at <= created_at <= left_at).
+        # Honcho server <= 3.0.12 resets joined_at when add_peers re-adds an already
+        # active member, which happens on every gateway restart. The server then returns
+        # an empty HTTP 200 instead of an error, so an exception-only fallback never
+        # fires. Fall back to peer-authored search on an empty result as well.
+        if not messages:
             try:
                 messages = self._authed_call(
                     "peer search",
