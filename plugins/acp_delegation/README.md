@@ -128,6 +128,39 @@ It **fails open when the worker advertised nothing**. An empty list means the
 worker never said, which is not evidence it has no commands — pi may never send
 the event at all.
 
+## The worker runs in `auto` mode
+
+Each delegation opens a **named acpx session**, sets its mode, prompts, then
+closes it. The mode is the reason for the session — `exec` is one-shot and
+cannot carry one.
+
+```yaml
+permission_mode: auto     # default; "default" restores prompt-everything
+```
+
+Without it a review cannot run at all. Reviewing code means running `git`, `gh`
+and tests, which are the ACP `execute` kind, and the kind policy below denies
+`execute`. It has to: acpx matches **kinds, never paths**, so allowing "run
+git" there also allows "run anything, anywhere".
+
+`auto` moves that judgement into the worker, whose classifier decides per action
+and mostly never asks acpx at all.
+
+**The two gates are sequential, not additive** — and that is the part that is
+easy to get backwards. A worker only asks acpx about what it did not settle
+itself, so the kind policy is the *backstop* for escalations, not the first
+word. That is also why `~/.claude/settings.json` looked ignored: its
+`permissions` rules do apply, but its `permissionMode` is read by the
+interactive CLI, not by the SDK the ACP adapter drives. acpx sets no mode of its
+own, so before this every session ran at the adapter's `default` and asked about
+everything.
+
+Session names are `acp-<run id>`, shared with the lease and the settings
+overlay so a run's three artefacts can be traced to each other. Teardown is
+best-effort: a leaked session costs a stale record, not a run. Note that
+`sessions close` takes the name **positionally** — passing it with `-s` is
+accepted and closes nothing.
+
 ## Two permission layers, because one is not enough
 
 | Layer | Enforced by | Scope |

@@ -153,6 +153,7 @@ def handle_acp_delegate(args: Dict[str, Any], **kwargs) -> str:
                 kind_policy=settings.kind_policy,
                 grace_seconds=config.DEADLINE_GRACE_SECONDS,
                 lease_id=run_id,
+                permission_mode=settings.permission_mode,
             ),
             _host_progress(),
         )
