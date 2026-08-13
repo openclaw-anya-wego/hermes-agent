@@ -3833,6 +3833,15 @@ class TurnRunner:
                         args if ctx._live_status_mode == "full" else None,
                     )
                     ctx._live_status_adapter.set_status_text(ctx.source.chat_id, _phrase)
+                elif event_type == "tool.status" and preview and ctx._run_still_current():
+                    # ANYA-PATCH: a long-running tool reporting its own progress.
+                    # Used verbatim — the tool knows what it is doing and the
+                    # tool name alone cannot say. Ignored in "verb" mode, which
+                    # exists to keep arguments out of shared channels.
+                    if ctx._live_status_mode == "full":
+                        ctx._live_status_adapter.set_status_text(
+                            ctx.source.chat_id, preview
+                        )
                 elif event_type == "tool.completed":
                     # Between tools the model is genuinely "thinking"
                     # again — revert to the static default.

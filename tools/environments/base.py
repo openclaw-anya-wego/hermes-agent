@@ -44,6 +44,8 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+# ANYA-PATCH: live status text, set by a long-running tool while it works.
+_status_callback_local = threading.local()
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -244,6 +246,33 @@ def get_activity_callback() -> Callable[[str], None] | None:
     back) — e.g. the manual cron-run heartbeat (#76502).
     """
     return getattr(_activity_callback_local, "callback", None)
+
+
+def set_status_callback(cb: Callable[[str], None] | None) -> None:
+    """ANYA-PATCH. Register a callback that replaces the live status text.
+
+    The status line is normally rendered once, from the tool name, when a tool
+    starts. That is fine for a tool that returns in seconds and useless for one
+    that blocks for an hour: the operator sees a frozen phrase and cannot tell
+    work from a hang.
+
+    A tool that knows what it is doing can call this to say so. The phrase is
+    used verbatim: nothing between here and the connector truncates, so the
+    caller owns both the wording and the length. See
+    ``acp_delegation.acpx_process.STATUS_PHRASE_MAX_CHARS`` for the budget one
+    caller holds itself to.
+    """
+    _status_callback_local.callback = cb
+
+
+def get_status_callback() -> Callable[[str], None] | None:
+    """The calling thread's status callback (see ``set_status_callback``).
+
+    Thread-local for the same reason the activity callback is: a tool that hands
+    work to reader threads must capture this on its own thread first, because a
+    freshly spawned thread cannot look it up.
+    """
+    return getattr(_status_callback_local, "callback", None)
 
 
 def touch_activity_if_due(

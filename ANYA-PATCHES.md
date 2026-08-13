@@ -121,6 +121,33 @@ is still opt-in (`hermes_cli/plugins.py:1468`). It refuses to run until
 See `plugins/acp_delegation/README.md` for configuration, the two permission
 layers, and the error taxonomy.
 
+#### Live status for a long-running tool
+
+Three core files carry a small addition so `acp_delegate` can say what it is
+doing. Expect conflicts here on an upstream merge:
+
+| File | Change |
+| --- | --- |
+| `tools/environments/base.py` | `set_status_callback` / `get_status_callback`, thread-local, mirroring the activity pair beside them |
+| `agent/tool_executor.py` | registers one per tool call, pointed at that tool's name |
+| `gateway/run.py` | renders a `tool.status` event verbatim onto the live status line |
+
+The status line is otherwise rendered once, from the tool name, when a tool
+starts. That suits a tool returning in seconds and fails one that blocks for an
+hour: the operator sees `is using acp_delegate…` frozen for the whole run and
+cannot tell work from a hang. With this the line reads
+`Delegating task to claude worker…`, then tracks the worker —
+`claude worker: Run bun test…`.
+
+Nothing in the path names a worker. The phrase interpolates whatever `worker`
+was asked for, so a new one needs no change here.
+
+The same events also keep the host's activity clock warm, which is what stops
+`agent.gateway_timeout` abandoning a delegation that is working normally. That
+clock is fed on **any** worker output rather than only on a change of action —
+see the plugin README. It is not fed by a timer, so a genuinely silent worker
+still times out as intended.
+
 ## Patches we carry
 
 Each patch carries a fix that is already open upstream. Delete the patch when

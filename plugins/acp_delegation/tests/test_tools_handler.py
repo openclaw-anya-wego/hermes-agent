@@ -5,6 +5,7 @@ out, on every path. acpx is stubbed, so nothing here spawns a worker or spends
 tokens.
 """
 
+import dataclasses
 import json
 import os
 import shutil
@@ -54,8 +55,11 @@ class HandlerTestCase(unittest.TestCase):
         acpx_process.run = self.original_run
 
     def stub_run(self, result):
-        def _run(**kwargs):
-            self.calls.append(kwargs)
+        def _run(request, host_progress=None):
+            # Recorded as a plain dict so a test can assert on one field
+            # without restating the whole request.
+            self.calls.append(dataclasses.asdict(request))
+            self.host_progress = host_progress
             if isinstance(result, Exception):
                 raise result
             return result
@@ -311,8 +315,8 @@ class OverlayLifecycleTests(HandlerTestCase):
     def test_installs_deny_rules_while_the_worker_runs(self):
         seen = {}
 
-        def _run(**kwargs):
-            del kwargs
+        def _run(request, host_progress=None):
+            del request, host_progress
             with open(self.settings_file(), "r", encoding="utf-8") as handle:
                 seen["deny"] = json.load(handle)["permissions"]["deny"]
             return outcome()
