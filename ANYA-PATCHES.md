@@ -1,12 +1,30 @@
 # ANYA-PATCHES
 
-This branch holds the Anya-specific setup for the Hermes agent.
+This file holds the Anya-specific setup for the Hermes agent.
 
 ## Branch rules
 
-- `anya-patches` is the working branch. Make all changes on this branch.
-- `main` is a read-only mirror of `NousResearch/hermes-agent`. Do not commit to `main`.
+- **`main` is the working branch.** Make all changes on `main`. The mini builds
+  and runs `main`.
 - The fork is `openclaw-anya-wego/hermes-agent`.
+- `anya-patches` is retired. It was the working branch until 2026-08-13, when
+  everything on it merged into `main`.
+
+### Taking upstream changes
+
+`main` is no longer a clean mirror of `NousResearch/hermes-agent`, so upstream
+arrives by merge rather than by fast-forward:
+
+```bash
+git remote add upstream https://github.com/NousResearch/hermes-agent.git   # once
+git fetch upstream
+git merge upstream/main
+```
+
+Expect conflicts in the files listed under *Patches we carry* below. That
+is the cost of running work on `main`: the previous layout answered "what did we
+change?" with `git diff main..anya-patches`, and now the answer is this file.
+Keep it current — it is the only remaining record of what is ours.
 
 ## Install
 
@@ -78,7 +96,7 @@ The mini has 16 GB of RAM. The box is oversubscribed.
 Hermes needs about 400 MB to 700 MB for two Python processes.
 Free memory before you start Hermes. A reboot clears the swap and the accumulated leaks.
 
-## Additions on this branch
+## Additions we own
 
 Local code that is not a patch. It fixes nothing upstream and will never be sent
 there, so it does not belong in the patch list below.
@@ -103,7 +121,7 @@ is still opt-in (`hermes_cli/plugins.py:1468`). It refuses to run until
 See `plugins/acp_delegation/README.md` for configuration, the two permission
 layers, and the error taxonomy.
 
-## Patches on this branch
+## Patches we carry
 
 Each patch carries a fix that is already open upstream. Delete the patch when
 upstream merges the fix.
