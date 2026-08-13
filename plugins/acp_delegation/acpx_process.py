@@ -8,7 +8,9 @@ the concurrent path, which abandons the whole batch after
 ``_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S`` (420 s) — shorter than this plugin's 900 s
 default and its 3600 s maximum. Adding this tool there without also clamping the
 timeout would report a live delegation as failed and leave the overlay installed
-on a thread nobody is waiting for.
+on a thread nobody is waiting for. Progress reporting would stop too, silently:
+the status callback is registered in ``_begin_tool_execution``, which only the
+sequential path reaches.
 
 While a worker is running this writes a lease file that ``safe-restart.sh``
 reads, so a gateway restart can tell a delegation is in flight. The lease is
@@ -28,7 +30,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from plugins.acp_delegation import parse
 
@@ -41,6 +43,21 @@ TERMINATE_GRACE_SECONDS = 2
 # reader sees movement, and rare enough that a chatty worker cannot turn the
 # status line into a flicker.
 ACTIVITY_INTERVAL_SECONDS = 5
+
+# How often the host's activity clock is told the delegation is still alive.
+# The gateway warns at 900 s of inactivity and abandons the turn at 1800 s
+# (agent.gateway_timeout), so this leaves a wide margin for a worker that goes
+# quiet between lines.
+KEEP_ALIVE_INTERVAL_SECONDS = 60
+
+# What the clock is told before the worker names its first action. Spawn and
+# session setup produce output well before any tool call.
+UNNAMED_ACTIVITY = "working"
+
+# Slack renders the assistant status line at roughly this width. Nothing between
+# set_status_text() and the connector truncates, so the phrase's author is the
+# only party that can hold the budget.
+STATUS_PHRASE_MAX_CHARS = 50
 
 LEASE_DIRECTORY = os.path.join("runtime", "acp_delegation", "active")
 
@@ -60,27 +77,59 @@ class RunOutcome:
     stderr_tail: str
 
 
-def run(
-    acpx_bin: str,
-    worker: str,
-    task: str,
-    working_directory: str,
-    timeout_seconds: int,
-    kind_policy: Dict[str, Any],
-    grace_seconds: int,
-    lease_id: str,
-) -> RunOutcome:
+@dataclass(frozen=True)
+class RunRequest:
+    """Everything one delegation needs in order to start.
+
+    A parameter object rather than a flat argument list, which this module grew
+    another entry on every time it learned something. The caller already holds
+    these as a settings object plus a validated request.
+    """
+
+    acpx_bin: str
+    worker: str
+    task: str
+    working_directory: str
+    timeout_seconds: int
+    kind_policy: Dict[str, Any]
+    grace_seconds: int
+    lease_id: str
+
+
+class HostProgress(NamedTuple):
+    """The host surfaces a running delegation may report to. Both optional.
+
+    Injected rather than looked up here. Both callbacks are thread-local to the
+    handler's thread, and ``tools.py`` is the only module in this plugin that
+    imports Hermes — so the capture belongs there and the plumbing belongs here.
+    """
+
+    publish_status: Optional[Callable[[str], None]] = None
+    report_activity: Optional[Callable[[str], None]] = None
+
+
+def run(request: RunRequest, host_progress: Optional[HostProgress] = None) -> RunOutcome:
     """Execute one delegation and return everything observed.
 
     ``exit_code`` is None when the deadline fired and acpx had to be killed,
     which the caller reports differently from acpx timing the worker out itself.
-    """
-    command = _build_command(acpx_bin, worker, working_directory, timeout_seconds, kind_policy)
-    process = _spawn(command, working_directory)
 
-    lease_path = _write_lease(lease_id, process.pid, worker, working_directory)
+    ``host_progress`` is absent in the tests and on any host that registered no
+    callbacks. Reporting is a courtesy; the delegation runs identically without.
+    """
+    command = _build_command(request)
+    process = _spawn(command, request.working_directory)
+
+    lease_path = _write_lease(
+        request.lease_id, process.pid, request.worker, request.working_directory
+    )
     stdout_lines: "queue.Queue[Optional[str]]" = queue.Queue()
     stderr_tail: deque = deque(maxlen=STDERR_TAIL_LINES)
+    # Readers outlive this function on the deadline path: _join gives up after a
+    # second while the reader is still blocked on a pipe that only closes below.
+    # Without this it can then paint a dead worker's phrase over the next tool's
+    # status line.
+    finished = threading.Event()
 
     try:
         # Readers first, and the prompt written from its own thread. Writing it
@@ -88,25 +137,21 @@ def run(
         # blocks in write() while acpx blocks writing output nobody is draining.
         # That happens before the deadline loop below is armed, so nothing would
         # ever time it out.
-        # Captured here, on the handler's thread. The host's activity callback
-        # is thread-local, so a reader thread cannot look it up for itself —
-        # get_activity_callback exists for exactly this handoff.
-        publish_status = _capture_status_publisher()
-        if publish_status is not None:
-            publish_status(waiting_phrase(worker))
+        _announce_waiting(request.worker, host_progress)
         readers = _start_readers(
             process,
             stdout_lines,
             stderr_tail,
-            _combined_reporter(worker, publish_status),
+            _progress_relay(request.worker, host_progress, finished),
         )
-        writer = _start_writer(process, task)
+        writer = _start_writer(process, request.task)
         transcript, exit_code = _collect(
-            process, stdout_lines, timeout_seconds + grace_seconds
+            process, stdout_lines, request.timeout_seconds + request.grace_seconds
         )
         _join(readers + [writer])
         return RunOutcome(transcript, exit_code, _stderr_text(stderr_tail))
     finally:
+        finished.set()
         _terminate(process)
         _close_pipes(process)
         _remove_lease(lease_path)
@@ -122,29 +167,23 @@ def lease_directory() -> str:
     return os.path.join(home, LEASE_DIRECTORY)
 
 
-def _build_command(
-    acpx_bin: str,
-    worker: str,
-    working_directory: str,
-    timeout_seconds: int,
-    kind_policy: Dict[str, Any],
-) -> List[str]:
+def _build_command(request: RunRequest) -> List[str]:
     """Assemble the acpx invocation.
 
     The task itself is not here. It goes over stdin via ``-f -`` so that no
     prompt can be mangled by argv quoting or hit an argument-length limit.
     """
     return [
-        acpx_bin,
+        request.acpx_bin,
         "--cwd",
-        working_directory,
+        request.working_directory,
         "--format",
         "json",
         "--timeout",
-        str(timeout_seconds),
+        str(request.timeout_seconds),
         "--permission-policy",
-        json.dumps(kind_policy),
-        worker,
+        json.dumps(request.kind_policy),
+        request.worker,
         "exec",
         "-f",
         "-",
@@ -242,89 +281,78 @@ def activity_phrase(worker: str, activity: str) -> str:
     change here — it only has to speak ACP, which is the one thing every worker
     this plugin can reach already does.
 
-    Kept short on purpose: the platform truncates around 50 characters, and
-    ``<worker> worker: `` already spends up to 15 of them.
+    Truncated rather than trusted: ``activity`` is a worker-supplied string read
+    straight off the wire, so nothing bounds it but this.
     """
-    return "{} worker: {}".format(worker, activity)
+    phrase = "{} worker: {}".format(worker, activity)
+    if len(phrase) <= STATUS_PHRASE_MAX_CHARS:
+        return phrase
+    return phrase[: STATUS_PHRASE_MAX_CHARS - 1] + "…"
 
 
-def _capture_status_publisher():
-    """A callable that sets the operator-visible status phrase, or None.
+def _announce_waiting(worker: str, host_progress: Optional[HostProgress]) -> None:
+    """Say the worker is starting, before it has done anything worth reporting."""
+    if host_progress is None or host_progress.publish_status is None:
+        return
+    _safely(host_progress.publish_status, waiting_phrase(worker))
 
-    Takes a finished phrase, so the caller owns the wording — the waiting text
-    and the per-action text are different sentences, not one template.
 
-    Captured on the handler's thread: the host's callback is thread-local and a
-    reader thread cannot look it up for itself.
-    """
-    try:
-        from tools.environments.base import get_status_callback
-
-        callback = get_status_callback()
-    except Exception:
+def _progress_relay(
+    worker: str, host_progress: Optional[HostProgress], finished: threading.Event
+):
+    """What the stdout reader drives, or None when no host is listening."""
+    if host_progress is None:
         return None
-    return callback
-
-
-def _combined_reporter(worker: str, publish_status):
-    """One reporter driving both surfaces, or None when neither exists.
-
-    They want the same events at the same rate but say different things: the
-    status line is a sentence for a human, the activity clock is a heartbeat
-    that keeps the stall watchdog quiet. Throttling them together keeps the two
-    from disagreeing about what the worker is doing.
-    """
-    report_activity = _capture_activity_reporter(worker)
-    if report_activity is None and publish_status is None:
+    report_status = _surface(worker, host_progress.publish_status, finished)
+    keep_alive = _surface(worker, host_progress.report_activity, finished)
+    if report_status is None and keep_alive is None:
         return None
-
-    def report(activity: str) -> None:
-        if publish_status is not None:
-            try:
-                publish_status(activity_phrase(worker, activity))
-            except Exception:
-                pass
-        if report_activity is not None:
-            report_activity(activity)
-
-    return report
+    return _ProgressRelay(report_status, keep_alive)
 
 
-def _capture_activity_reporter(worker: str):
-    """A callable that tells the host what the worker is doing, or None.
+def _surface(
+    worker: str, callback: Optional[Callable[[str], None]], finished: threading.Event
+):
+    """Wrap one host callback: it takes an activity, says the shared sentence,
+    stays quiet once the run is over, and never raises.
 
-    Returns None when Hermes is absent — the tests run without it — or when the
-    host registered no callback, so progress reporting stays entirely optional.
+    Both surfaces say the same thing, so the phrase is built in one place. What
+    differs is when each is called, and that belongs to ``_ProgressRelay``.
 
-    Reporting matters more here than for an ordinary tool. This call blocks for
-    as long as the delegation runs, up to 90 minutes, and a host that sees no
-    activity for that long cannot distinguish a working worker from a hung one.
+    Nothing reports after ``finished`` is set. On the deadline path a reader
+    outlives the run, and a late phrase paints a dead worker over whatever the
+    host does next.
     """
-    try:
-        from tools.environments.base import get_activity_callback
-
-        callback = get_activity_callback()
-    except Exception:
-        return None
     if callback is None:
         return None
 
-    def report(activity: str) -> None:
-        try:
-            callback("{} worker: {}".format(worker, activity))
-        except Exception:
-            # Progress is a courtesy. A host that raises here must not take the
-            # delegation down with it.
-            pass
+    def send(activity: str) -> None:
+        if finished.is_set():
+            return
+        _safely(callback, activity_phrase(worker, activity))
 
-    return report
+    return send
+
+
+def _safely(surface: Callable[[str], None], phrase: str) -> None:
+    """Hand a phrase to a host surface, absorbing whatever it does with it.
+
+    Progress is a courtesy, and this runs on the only thread draining the
+    worker's stdout: an exception escaping here stops that drain and the worker
+    then blocks forever on a full pipe — a hang caused entirely by the code that
+    exists to prove there is none.
+    """
+    try:
+        surface(phrase)
+    except Exception:
+        pass
 
 
 def _start_readers(
     process: subprocess.Popen,
     stdout_lines: "queue.Queue[Optional[str]]",
     stderr_tail: deque,
-    report_activity=None,
+    relay=None,
 ) -> List[threading.Thread]:
     """Drain both pipes concurrently.
 
@@ -334,7 +362,7 @@ def _start_readers(
     readers = [
         threading.Thread(
             target=_read_stdout,
-            args=(process, stdout_lines, report_activity),
+            args=(process, stdout_lines, relay),
             daemon=True,
         ),
         threading.Thread(target=_read_stderr, args=(process, stderr_tail), daemon=True),
@@ -347,7 +375,7 @@ def _start_readers(
 def _read_stdout(
     process: subprocess.Popen,
     lines: "queue.Queue[Optional[str]]",
-    report_activity=None,
+    relay=None,
 ) -> None:
     """Drain stdout, and always post the sentinel.
 
@@ -359,51 +387,100 @@ def _read_stdout(
     sees every line as it arrives. The collector is free to fall behind, and a
     status report that lags the worker is worse than none.
     """
-    reporter = _ActivityThrottle(report_activity)
     try:
         for line in process.stdout:
             lines.put(line)
-            reporter.consider(line)
+            _relay_line(relay, line)
     except (OSError, ValueError):
         pass
     finally:
         lines.put(None)
 
 
-class _ActivityThrottle:
-    """Reports the worker's current action, no more than one report per window.
+def _relay_line(relay, line: str) -> None:
+    """Offer one line to the relay, absorbing anything it does with it.
 
-    Keeps its own throwaway transcript: this thread only needs the newest
-    activity line, and folding into the real transcript from here would race the
-    collector that owns it.
+    This is the only thread draining the worker's stdout. An exception escaping
+    here stops that drain, the worker then blocks forever on a full pipe, and
+    the run hangs — caused entirely by the code that exists to prove it has not.
+    Progress is never worth that, whether the fault is a host callback or a line
+    shaped in a way the parser did not expect.
+    """
+    if relay is None:
+        return
+    try:
+        relay.consider(line)
+    except Exception:
+        pass
+
+
+class _Throttle:
+    """Lets an event through at most once per interval."""
+
+    def __init__(self, interval_seconds: float):
+        self._interval = interval_seconds
+        self._next_at = 0.0
+
+    def due(self, now: float) -> bool:
+        if now < self._next_at:
+            return False
+        self._next_at = now + self._interval
+        return True
+
+
+class _ProgressRelay:
+    """Turns the worker's stdout into the two signals a host needs.
+
+    Same sentence, deliberately different cadence:
+
+    - The **status line** is read by a human, so it moves only when the work
+      does. Repeating a phrase every few seconds is flicker, not information.
+    - The **activity clock** proves the turn is alive to the gateway's
+      inactivity watchdog (warns at 15 min, kills at 30). A repeat still counts.
+      Reporting only on change is what let a live 26-minute delegation be warned
+      about at 23: the worker had settled into one long step, so the title
+      stopped changing and the clock went stale while it worked.
+
+    Driven by the worker's own output, never by a bare timer. A timer would tick
+    the clock forever and mask a genuinely hung worker, which is the fault the
+    watchdog exists to catch — so a silent acpx still times out, as it should.
+
+    Reads each line on its own rather than folding a transcript here: this
+    thread needs one string, the collector already owns the real transcript, and
+    a second copy would retain a whole 90-minute run to read the newest line off
+    the end of it.
     """
 
-    def __init__(self, report):
-        self._report = report
-        self._transcript = parse.Transcript()
+    def __init__(self, report_status=None, keep_alive=None):
+        self._report_status = report_status
+        self._keep_alive = keep_alive
+        self._status_due = _Throttle(ACTIVITY_INTERVAL_SECONDS)
+        self._keep_alive_due = _Throttle(KEEP_ALIVE_INTERVAL_SECONDS)
         self._last_reported = None
-        self._next_report_at = 0.0
+        self._latest_activity = None
 
     def consider(self, line: str) -> None:
-        if self._report is None:
-            return
-        parse.consume_line(self._transcript, line)
-        activity = self._transcript.last_activity
-        if not activity or activity == self._last_reported:
-            return
         now = time.monotonic()
-        if now < self._next_report_at:
+        activity = parse.activity_from_line(line)
+        if activity:
+            self._latest_activity = activity
+            self._show_status(activity, now)
+        # Any line at all is evidence the worker is alive, including one this
+        # plugin has no opinion about.
+        self._keep_clock_warm(now)
+
+    def _show_status(self, activity: str, now: float) -> None:
+        if self._report_status is None or activity == self._last_reported:
+            return
+        if not self._status_due.due(now):
             return
         self._last_reported = activity
-        self._next_report_at = now + ACTIVITY_INTERVAL_SECONDS
-        try:
-            self._report(activity)
-        except Exception:
-            # This runs on the stdout reader. An exception escaping here kills
-            # the only thread draining that pipe, and the worker then blocks
-            # forever on a full buffer — a hang caused entirely by the code that
-            # exists to prove there is no hang.
-            pass
+        self._report_status(activity)
+
+    def _keep_clock_warm(self, now: float) -> None:
+        if self._keep_alive is None or not self._keep_alive_due.due(now):
+            return
+        self._keep_alive(self._latest_activity or UNNAMED_ACTIVITY)
 
 
 def _read_stderr(process: subprocess.Popen, tail: deque) -> None:

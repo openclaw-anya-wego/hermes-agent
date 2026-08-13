@@ -126,6 +126,23 @@ def consume_line(transcript: Transcript, raw_line: str) -> None:
         _consume_result(transcript, message.get("result"))
 
 
+def activity_from_line(raw_line: str) -> Optional[str]:
+    """The worker's current action from one line, or None.
+
+    Separate from ``consume_line`` so a caller wanting only the newest action
+    does not have to keep a transcript it will never read. The stdout reader is
+    that caller: folding would leave it holding a second full copy of everything
+    the worker streamed, for the whole run, to read one string off the end.
+    """
+    message = _load_json(raw_line)
+    if message is None or message.get("method") != "session/update":
+        return None
+    update = message.get("params", {}).get("update", {})
+    if update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+        return None
+    return _activity_title(update)
+
+
 def build_result(
     transcript: Transcript,
     exit_code: Optional[int],
@@ -278,7 +295,13 @@ def _consume_session_update(transcript: Transcript, update: Dict[str, Any]) -> N
 
 
 def _consume_activity(transcript: Transcript, update: Dict[str, Any]) -> None:
-    """Record what the worker is doing, in its own words.
+    title = _activity_title(update)
+    if title is not None:
+        transcript.last_activity = title
+
+
+def _activity_title(update: Dict[str, Any]) -> Optional[str]:
+    """What the worker is doing, in its own words, or None.
 
     The adapter's ``title`` is already written for a human ("Read
     FareParser.java", "Run bun test") — better than anything this module could
@@ -290,10 +313,11 @@ def _consume_activity(transcript: Transcript, update: Dict[str, Any]) -> None:
     takes, which reads as a stall precisely when the worker is busiest.
     """
     if update.get("status") == "completed":
-        return
+        return None
     title = update.get("title")
     if isinstance(title, str) and title.strip():
-        transcript.last_activity = title.strip()
+        return title.strip()
+    return None
 
 
 def _consume_available_commands(transcript: Transcript, commands: Any) -> None:

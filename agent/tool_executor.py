@@ -728,7 +728,9 @@ def _begin_tool_execution(
 
     # ANYA-PATCH: let a long-running tool replace the live status text while it
     # works. Registered per tool call and pointed at this tool's name, so a
-    # phrase can never outlive the call that produced it.
+    # phrase always names the tool that produced it. Nothing clears the
+    # registration afterwards, so a tool that hands this to a background thread
+    # owns stopping that thread — see acp_delegation's `finished` event.
     try:
         from tools.environments.base import set_status_callback
 

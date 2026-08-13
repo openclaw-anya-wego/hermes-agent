@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 
 REPO_ROOT = os.path.dirname(
@@ -84,16 +85,26 @@ class ProcessTestCase(unittest.TestCase):
         os.chmod(wrapper, 0o755)
         return wrapper
 
-    def run_task(self, binary, task="hello", timeout_seconds=30, grace_seconds=5):
+    def run_task(
+        self,
+        binary,
+        task="hello",
+        timeout_seconds=30,
+        grace_seconds=5,
+        host_progress=None,
+    ):
         return acpx_process.run(
-            acpx_bin=binary,
-            worker="claude",
-            task=task,
-            working_directory=self.workdir,
-            timeout_seconds=timeout_seconds,
-            kind_policy=KIND_POLICY,
-            grace_seconds=grace_seconds,
-            lease_id="testlease",
+            acpx_process.RunRequest(
+                acpx_bin=binary,
+                worker="claude",
+                task=task,
+                working_directory=self.workdir,
+                timeout_seconds=timeout_seconds,
+                kind_policy=KIND_POLICY,
+                grace_seconds=grace_seconds,
+                lease_id="testlease",
+            ),
+            host_progress,
         )
 
 
@@ -190,17 +201,16 @@ class LeaseTests(ProcessTestCase):
         self.assertEqual(outcome.exit_code, 0)
 
 
-class ActivityThrottleTests(unittest.TestCase):
-    """Progress reporting from the reader thread.
+class StatusRelayTests(unittest.TestCase):
+    """What the operator's status line shows, from the reader thread.
 
-    Exercised directly rather than through a subprocess: the throttle is where
-    the rate limiting and de-duplication live, and both are invisible in an
-    end-to-end run.
+    Exercised directly rather than through a subprocess: the rate limiting and
+    de-duplication live here, and both are invisible in an end-to-end run.
     """
 
     def setUp(self):
         self.reported = []
-        self.throttle = acpx_process._ActivityThrottle(self.reported.append)
+        self.throttle = acpx_process._ProgressRelay(report_status=self.reported.append)
 
     def line(self, title, status="in_progress"):
         return json.dumps(
@@ -230,7 +240,7 @@ class ActivityThrottleTests(unittest.TestCase):
 
     def test_reports_again_once_the_window_passes(self):
         self.throttle.consider(self.line("Read a.java"))
-        self.throttle._next_report_at = 0.0
+        self.throttle._status_due._next_at = 0.0
 
         self.throttle.consider(self.line("Edit b.java"))
 
@@ -238,7 +248,7 @@ class ActivityThrottleTests(unittest.TestCase):
 
     def test_does_not_repeat_an_unchanged_action(self):
         self.throttle.consider(self.line("Read a.java"))
-        self.throttle._next_report_at = 0.0
+        self.throttle._status_due._next_at = 0.0
 
         self.throttle.consider(self.line("Read a.java"))
 
@@ -246,7 +256,7 @@ class ActivityThrottleTests(unittest.TestCase):
 
     def test_is_inert_without_a_reporter(self):
         """No host callback means no reporting, and certainly no crash."""
-        silent = acpx_process._ActivityThrottle(None)
+        silent = acpx_process._ProgressRelay()
 
         silent.consider(self.line("Read a.java"))
 
@@ -254,6 +264,62 @@ class ActivityThrottleTests(unittest.TestCase):
         self.throttle.consider("not json at all\n")
 
         self.assertEqual(self.reported, [])
+
+
+class KeepAliveTests(unittest.TestCase):
+    """The activity clock, which is a liveness proof rather than a status.
+
+    The gateway abandons a turn after 1800 s with no activity. A delegation runs
+    for up to 90 minutes, so whether this keeps ticking decides whether a
+    working worker survives — one live 26-minute run was warned about at 23.
+    """
+
+    def setUp(self):
+        self.alive = []
+        self.relay = acpx_process._ProgressRelay(keep_alive=self.alive.append)
+
+    def line(self, title, status="in_progress"):
+        return json.dumps(
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "title": title,
+                        "status": status,
+                    }
+                },
+            }
+        )
+
+    def test_reports_a_repeated_action_the_status_line_would_suppress(self):
+        """The whole bug: one long step is work, not silence."""
+        self.relay.consider(self.line("Run bun test"))
+        self.relay._keep_alive_due._next_at = 0.0
+
+        self.relay.consider(self.line("Run bun test"))
+
+        self.assertEqual(self.alive, ["Run bun test", "Run bun test"])
+
+    def test_counts_a_line_that_names_no_action(self):
+        """Protocol chatter is still evidence the worker is alive."""
+        self.relay.consider('{"method": "session/update", "params": {}}')
+
+        self.assertEqual(self.alive, ["working"])
+
+    def test_throttles_so_a_chatty_worker_costs_one_call(self):
+        for index in range(50):
+            self.relay.consider(self.line("Step {}".format(index)))
+
+        self.assertEqual(len(self.alive), 1)
+
+    def test_names_the_action_once_the_worker_has_one(self):
+        self.relay.consider("noise\n")
+        self.relay._keep_alive_due._next_at = 0.0
+
+        self.relay.consider(self.line("Edit Fare.java"))
+
+        self.assertEqual(self.alive, ["working", "Edit Fare.java"])
 
 
 class StatusPhraseTests(unittest.TestCase):
@@ -292,60 +358,115 @@ class StatusPhraseTests(unittest.TestCase):
             self.assertLessEqual(len(acpx_process.waiting_phrase(worker)), 50)
 
 
-class CombinedReporterTests(unittest.TestCase):
-    def test_is_none_when_neither_surface_exists(self):
-        self.assertIsNone(acpx_process._combined_reporter("claude", None))
+class ProgressRelayWiringTests(unittest.TestCase):
+    """Which surfaces a run reports to, and what they are handed."""
 
-    def test_publishes_the_worker_prefixed_phrase(self):
+    def setUp(self):
+        self.finished = threading.Event()
+
+    def test_is_none_when_the_host_offers_nothing(self):
+        self.assertIsNone(
+            acpx_process._progress_relay("claude", None, self.finished)
+        )
+
+    def test_is_none_when_the_host_registered_no_callbacks(self):
+        """A host present but silent. Asserted directly rather than by relying
+        on Hermes being absent from the test environment."""
+        self.assertIsNone(
+            acpx_process._progress_relay(
+                "claude", acpx_process.HostProgress(), self.finished
+            )
+        )
+
+    def test_both_surfaces_get_the_same_sentence(self):
         published = []
+        alive = []
+        relay = acpx_process._progress_relay(
+            "claude",
+            acpx_process.HostProgress(published.append, alive.append),
+            self.finished,
+        )
 
-        report = acpx_process._combined_reporter("claude", published.append)
-        report("Run bun test")
+        relay.consider(_tool_call_line("Run bun test"))
 
         self.assertEqual(published, ["claude worker: Run bun test"])
+        self.assertEqual(alive, ["claude worker: Run bun test"])
 
-    def test_a_failing_status_publisher_does_not_stop_the_run(self):
+    def test_nothing_reports_once_the_run_is_over(self):
+        """A reader outlives the run on the deadline path. A late phrase would
+        paint a dead worker over whatever the host does next."""
+        published = []
+        relay = acpx_process._progress_relay(
+            "claude", acpx_process.HostProgress(published.append), self.finished
+        )
+        self.finished.set()
+
+        relay.consider(_tool_call_line("Run bun test"))
+
+        self.assertEqual(published, [])
+
+    def test_a_failing_host_surface_does_not_stop_the_run(self):
         def explode(_):
             raise RuntimeError("status surface is down")
 
-        acpx_process._combined_reporter("claude", explode)("Run bun test")
+        relay = acpx_process._progress_relay(
+            "claude", acpx_process.HostProgress(explode, explode), self.finished
+        )
+
+        relay.consider(_tool_call_line("Run bun test"))
 
 
-class ActivityReporterTests(ProcessTestCase):
-    def test_is_none_when_the_host_offers_no_callback(self):
-        """The tests run without Hermes, so this is also the offline path."""
-        self.assertIsNone(acpx_process._capture_activity_reporter("claude"))
-
-    def test_a_raising_host_callback_cannot_kill_the_reader(self):
+class ReaderSafetyTests(unittest.TestCase):
+    def test_a_raising_relay_cannot_kill_the_reader(self):
         """This runs on the only thread draining stdout.
 
         An exception escaping here stops that drain, the worker blocks on a full
         pipe, and the run hangs — caused by the code meant to prove it has not.
         """
-        def explode(_):
-            raise RuntimeError("host is unhappy")
+        class Explosive:
+            def consider(self, line):
+                raise RuntimeError("relay is unhappy")
 
-        throttle = acpx_process._ActivityThrottle(explode)
+        acpx_process._relay_line(Explosive(), "anything")
 
-        throttle.consider(
-            json.dumps(
-                {
-                    "method": "session/update",
-                    "params": {
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "title": "x",
-                            "status": "in_progress",
-                        }
-                    },
-                }
-            )
+    def test_tolerates_a_line_the_parser_did_not_expect(self):
+        """`params` is worker-supplied and need not be an object."""
+        relay = acpx_process._ProgressRelay(report_status=lambda _: None)
+
+        acpx_process._relay_line(
+            relay, '{"method": "session/update", "params": "not an object"}'
         )
+
+
+def _tool_call_line(title, status="in_progress"):
+    return json.dumps(
+        {
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": title,
+                    "status": status,
+                }
+            },
+        }
+    )
 
 
 class CommandTests(ProcessTestCase):
     def test_passes_the_policy_and_cwd_to_acpx(self):
-        command = acpx_process._build_command("acpx", "pi", "/tmp/repo", 300, KIND_POLICY)
+        command = acpx_process._build_command(
+            acpx_process.RunRequest(
+                acpx_bin="acpx",
+                worker="pi",
+                task="anything",
+                working_directory="/tmp/repo",
+                timeout_seconds=300,
+                kind_policy=KIND_POLICY,
+                grace_seconds=5,
+                lease_id="testlease",
+            )
+        )
 
         self.assertEqual(command[0], "acpx")
         self.assertIn("--permission-policy", command)
@@ -371,9 +492,21 @@ class CommandTests(ProcessTestCase):
 
     def test_sends_the_task_over_stdin_rather_than_argv(self):
         """Argv quoting and length limits are not worth risking on a prompt."""
-        command = acpx_process._build_command("acpx", "claude", "/tmp/repo", 300, KIND_POLICY)
+        command = acpx_process._build_command(
+            acpx_process.RunRequest(
+                acpx_bin="acpx",
+                worker="claude",
+                task="a very long prompt",
+                working_directory="/tmp/repo",
+                timeout_seconds=300,
+                kind_policy=KIND_POLICY,
+                grace_seconds=5,
+                lease_id="testlease",
+            )
+        )
 
         self.assertEqual(command[-3:], ["exec", "-f", "-"])
+        self.assertNotIn("a very long prompt", command)
 
 
 if __name__ == "__main__":

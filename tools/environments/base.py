@@ -257,8 +257,10 @@ def set_status_callback(cb: Callable[[str], None] | None) -> None:
     work from a hang.
 
     A tool that knows what it is doing can call this to say so. The phrase is
-    used verbatim, so the caller owns the wording and the length — the platform
-    truncates around 50 characters.
+    used verbatim: nothing between here and the connector truncates, so the
+    caller owns both the wording and the length. See
+    ``acp_delegation.acpx_process.STATUS_PHRASE_MAX_CHARS`` for the budget one
+    caller holds itself to.
     """
     _status_callback_local.callback = cb
 

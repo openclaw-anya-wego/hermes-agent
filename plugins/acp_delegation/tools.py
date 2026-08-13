@@ -144,14 +144,17 @@ def handle_acp_delegate(args: Dict[str, Any], **kwargs) -> str:
             request["cwd"], _deny_rules_for(request["worker"]), run_id
         )
         outcome = acpx_process.run(
-            acpx_bin=settings.acpx_bin,
-            worker=request["worker"],
-            task=request["prompt"],
-            working_directory=request["cwd"],
-            timeout_seconds=request["timeout_seconds"],
-            kind_policy=settings.kind_policy,
-            grace_seconds=config.DEADLINE_GRACE_SECONDS,
-            lease_id=run_id,
+            acpx_process.RunRequest(
+                acpx_bin=settings.acpx_bin,
+                worker=request["worker"],
+                task=request["prompt"],
+                working_directory=request["cwd"],
+                timeout_seconds=request["timeout_seconds"],
+                kind_policy=settings.kind_policy,
+                grace_seconds=config.DEADLINE_GRACE_SECONDS,
+                lease_id=run_id,
+            ),
+            _host_progress(),
         )
     except acpx_process.SpawnError as error:
         return tool_error(str(error), error_type=error.error_type, success=False)
@@ -339,6 +342,50 @@ def _deny_rules_for(worker: str) -> List[str]:
     if worker != "claude":
         return []
     return DEFAULT_DENY_RULES
+
+
+def _host_progress() -> acpx_process.HostProgress:
+    """The host surfaces a running delegation reports to, captured on this thread.
+
+    Captured here rather than inside ``acpx_process`` for two reasons. Both
+    callbacks are thread-local, so a reader thread cannot look them up for
+    itself. And this module is the only one in the plugin that imports Hermes —
+    keeping that true is what lets the rest of it be tested without one.
+    """
+    return acpx_process.HostProgress(
+        publish_status=_status_callback(),
+        report_activity=_activity_callback(),
+    )
+
+
+def _status_callback():
+    """The live status line, or None.
+
+    An ANYA-PATCH surface: an unpatched Hermes has no ``get_status_callback``,
+    which is a missing feature rather than a fault, and must not take the
+    activity clock down with it.
+    """
+    try:
+        from tools.environments.base import get_status_callback
+
+        return get_status_callback()
+    except Exception:
+        return None
+
+
+def _activity_callback():
+    """The host's activity clock, or None.
+
+    This matters more here than for an ordinary tool: the call blocks for as
+    long as the delegation runs, and a host that sees no activity for 90 minutes
+    cannot tell a working worker from a hung one.
+    """
+    try:
+        from tools.environments.base import get_activity_callback
+
+        return get_activity_callback()
+    except Exception:
+        return None
 
 
 def _load_hermes_config() -> Dict[str, Any]:

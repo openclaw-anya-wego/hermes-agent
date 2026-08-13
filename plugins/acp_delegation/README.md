@@ -232,34 +232,52 @@ events and reports the newest one. The adapter's own `title` is used verbatim: i
 is already written for a human, and it is the same string an editor would
 display.
 
-Two surfaces, fed together:
+Two surfaces get the same sentence and deliberately **different cadences**:
 
-| Surface | Shows |
-| --- | --- |
-| Live status line | `Delegating task to claude worker…`, then `claude worker: Run bun test…` |
-| Host activity clock | the same events, keeping the stall watchdog quiet |
+| Surface | Fires on | Rate |
+| --- | --- | --- |
+| Live status line | the action **changing** | 5 s |
+| Host activity clock | **any** worker output | 60 s |
+
+They are not interchangeable. The status line is read by a human, so repeating a
+phrase is flicker rather than information. The activity clock is a liveness
+proof for the gateway's inactivity watchdog — `agent.gateway_timeout`, which
+warns at 15 minutes and abandons the turn at 30 — and there a repeat still
+counts.
+
+Reporting only on change is what made a live 26-minute delegation get *"⚠️ No
+activity for 15 min"* at 23 minutes: the worker had settled into one long step,
+the title stopped changing, and the clock went stale while it worked. A
+delegation may run for 90 minutes, so the clock is the only thing keeping the
+turn alive.
+
+The clock is driven by the worker's own output, never by a timer. A timer would
+tick forever and mask a genuinely hung worker, which is the fault the watchdog
+exists to catch — so an acpx that goes truly silent still times out.
 
 The status line needs the core patch described in `ANYA-PATCHES.md`; without it
-the plugin still reports to the activity clock and the line stays generic.
+the plugin still feeds the activity clock and the line stays generic.
 
 **Adding a worker changes nothing here.** The phrase interpolates the `worker`
 argument rather than branching on it, and the events come from ACP, which every
 reachable worker speaks: `codex worker: Edit Fare.java…` needs no code.
 
-- **At most one report per 5 s**, and never the same action twice. A worker doing
-  ten things a second would otherwise turn the status line into a flicker.
-- **`completed` updates are ignored.** Reporting a finished step would show it
-  for however long the next one takes — reading as a stall exactly when the
-  worker is busiest.
+- **`completed` updates are ignored** for the status line. Reporting a finished
+  step would show it for however long the next one takes — reading as a stall
+  exactly when the worker is busiest.
+- **The phrase is truncated** to `STATUS_PHRASE_MAX_CHARS`. Nothing between the
+  host and the connector truncates, and the action text comes off the wire.
+- **Nothing reports once the run ends.** On the deadline path a reader outlives
+  the call, and a late phrase would paint a dead worker over the next tool.
 - **Entirely optional.** No host callback means no reporting; the tests run this
   path offline.
 
-The callback is captured on the handler's thread, because the host's is
-thread-local and a reader thread cannot look it up for itself
-(`get_activity_callback` exists for this handoff). Failures are swallowed: an
-exception on the stdout reader would stop the only thread draining that pipe and
-hang the worker on a full buffer — a hang caused by the code proving there is
-none.
+Both callbacks are captured in `tools.py`, on the handler's thread, because the
+host's are thread-local and a reader thread cannot look them up for itself. They
+are passed in as `HostProgress` — which is what keeps every other module in this
+plugin free of Hermes imports. Failures are swallowed: an exception on the
+stdout reader would stop the only thread draining that pipe and hang the worker
+on a full buffer — a hang caused by the code proving there is none.
 
 Both workers are covered. `pi` emits the same ACP events, so nothing here is
 claude-specific.
