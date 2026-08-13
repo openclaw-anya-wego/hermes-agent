@@ -54,10 +54,16 @@ KEEP_ALIVE_INTERVAL_SECONDS = 60
 # session setup produce output well before any tool call.
 UNNAMED_ACTIVITY = "working"
 
-# Slack renders the assistant status line at roughly this width. Nothing between
-# set_status_text() and the connector truncates, so the phrase's author is the
-# only party that can hold the budget.
-STATUS_PHRASE_MAX_CHARS = 50
+# Nothing between set_status_text() and the connector truncates, so the phrase's
+# author is the only party that can hold a budget at all.
+#
+# Wider than the 49 `agent.display.build_status_phrase` uses. That number tracks
+# an observation that Slack truncates its status line "around 50 characters",
+# and a tool name plus a verb fits inside it. A delegation's phrase spends its
+# first 15 characters on "<worker> worker: " and then needs a path, so at 50 it
+# was arriving as "pi worker: read" — the budget, not Slack, was the constraint.
+# If Slack does clip this, it clips a phrase that already said which file.
+STATUS_PHRASE_MAX_CHARS = 80
 
 LEASE_DIRECTORY = os.path.join("runtime", "acp_delegation", "active")
 

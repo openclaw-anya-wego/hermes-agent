@@ -2944,15 +2944,56 @@ class SlackAdapter(BasePlatformAdapter):
                     _status = f"still working… ({_human})"
                 else:
                     _status = "is thinking..."
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status=_status,
+            await self._set_assistant_status(
+                chat_id, team_id=team_id, thread_ts=thread_ts, status=_status
             )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+
+    async def _set_assistant_status(
+        self, chat_id: str, *, team_id: str, thread_ts: str, status: str
+    ) -> None:
+        """ANYA-PATCH. Set both status surfaces, not just one.
+
+        Slack renders two things while an AI app works, and they are fed by
+        different arguments of the same call:
+
+          status           the line beneath the reply composer
+          loading_messages the indicator INLINE in the message list
+
+        Passing only ``status`` leaves the inline one to Slack's own rotating
+        placeholders — "Processing…", "Searching..." — which say nothing about
+        what this agent is actually doing, and which read as generic next to a
+        status line that names the file. One message rather than several: these
+        are progress, and rotating flavour text over real progress is a
+        downgrade.
+
+        The retry is not defensive habit. The whole call sits inside a bare
+        ``except`` that falls back to reactions, so a workspace or SDK that
+        rejects ``loading_messages`` would silently lose the composer line too —
+        trading a working surface for a new one.
+        """
+        client = self._get_client(chat_id, team_id=team_id)
+        try:
+            await client.assistant_threads_setStatus(
+                channel_id=chat_id,
+                thread_ts=thread_ts,
+                status=status,
+                loading_messages=[status],
+            )
+        except Exception as e:
+            logger.debug(
+                "[Slack] setStatus with loading_messages failed (%s); "
+                "retrying with status only",
+                e,
+            )
+            await client.assistant_threads_setStatus(
+                channel_id=chat_id,
+                thread_ts=thread_ts,
+                status=status,
+            )
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear the assistant thread status indicator."""

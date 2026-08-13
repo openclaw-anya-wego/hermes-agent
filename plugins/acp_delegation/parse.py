@@ -301,23 +301,69 @@ def _consume_activity(transcript: Transcript, update: Dict[str, Any]) -> None:
 
 
 def _activity_title(update: Dict[str, Any]) -> Optional[str]:
-    """What the worker is doing, in its own words, or None.
-
-    The adapter's ``title`` is already written for a human ("Read
-    FareParser.java", "Run bun test") — better than anything this module could
-    synthesise from the raw tool name and arguments, and it is the same field an
-    editor would display.
+    """What the worker is doing, or None.
 
     Only ``in_progress`` and untagged calls count. A ``completed`` update would
     report the previous action as the current one for however long the next step
     takes, which reads as a stall precisely when the worker is busiest.
+
+    The adapters disagree about ``title``, and the difference is stark on a
+    status line. ``claude-agent-acp`` writes a sentence — "Read
+    FareParser.java". ``pi-acp`` writes the bare tool name — "read", "bash" —
+    which tells an operator nothing at all about what the worker is doing. So
+    when the title carries no subject, one is taken from the rest of the event,
+    which both adapters populate.
     """
     if update.get("status") == "completed":
         return None
     title = update.get("title")
-    if isinstance(title, str) and title.strip():
-        return title.strip()
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    title = title.strip()
+    detail = _activity_detail(update)
+    if detail and not _already_named(title, detail):
+        return "{} {}".format(title, detail)
+    return title
+
+
+def _activity_detail(update: Dict[str, Any]) -> Optional[str]:
+    """The subject of the action — a path, a command — or None.
+
+    ``locations`` is preferred over ``rawInput``: it is the field an editor uses
+    to follow along, so an adapter that fills anything fills that.
+    """
+    for location in update.get("locations") or []:
+        if not isinstance(location, dict):
+            continue
+        path = location.get("path")
+        if isinstance(path, str) and path.strip():
+            return _tail(path.strip())
+
+    raw_input = update.get("rawInput")
+    if isinstance(raw_input, dict):
+        for key in ("command", "file_path", "path", "pattern", "query", "url"):
+            value = raw_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().splitlines()[0]
     return None
+
+
+def _already_named(title: str, detail: str) -> bool:
+    """Whether the title already says what the detail would add.
+
+    Without this a descriptive adapter gets its subject twice — "Read
+    FareParser.java src/FareParser.java".
+    """
+    lowered = title.lower()
+    return detail.lower() in lowered or detail.rsplit("/", 1)[-1].lower() in lowered
+
+
+def _tail(path: str, segments: int = 2) -> str:
+    """The last few path segments. An absolute path spends the whole budget on
+    a prefix that is the same for every file the worker touches."""
+    parts = [part for part in path.split("/") if part]
+    return "/".join(parts[-segments:]) if parts else path
 
 
 def _consume_available_commands(transcript: Transcript, commands: Any) -> None:

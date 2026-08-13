@@ -1993,8 +1993,41 @@ class TestSendTyping:
             channel_id="C123",
             thread_ts="parent_ts",
             status="is pouncing… 🐾",
+            # ANYA-PATCH: the same phrase drives Slack's inline indicator too,
+            # which otherwise falls back to its own rotating placeholders.
+            loading_messages=["is pouncing… 🐾"],
         )
 
+    @pytest.mark.asyncio
+    async def test_keeps_the_composer_status_when_loading_messages_is_rejected(self):
+        """ANYA-PATCH. A workspace or SDK without loading_messages must not
+        cost us the status line we already had.
+
+        The whole call sits inside a bare except that falls back to reactions,
+        so without the retry a rejected argument would silently disable both
+        surfaces — trading a working one for a new one.
+        """
+        config = PlatformConfig(
+            enabled=True, token="xoxb-fake-token",
+            typing_status_text="is pouncing… 🐾",
+        )
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        calls = []
+
+        async def picky(**kwargs):
+            calls.append(kwargs)
+            if "loading_messages" in kwargs:
+                raise TypeError("unexpected keyword argument 'loading_messages'")
+
+        a._app.client.assistant_threads_setStatus = AsyncMock(side_effect=picky)
+
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+
+        assert len(calls) == 2
+        assert "loading_messages" not in calls[1]
+        assert calls[1]["status"] == "is pouncing… 🐾"
 
     @pytest.mark.asyncio
     async def test_live_status_beats_configured_static_text(self):
@@ -2081,6 +2114,7 @@ class TestSendTyping:
             channel_id="C123",
             thread_ts="171.000",
             status="is thinking...",
+            loading_messages=["is thinking..."],
         )
 
 
