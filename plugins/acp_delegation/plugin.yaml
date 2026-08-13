@@ -1,0 +1,7 @@
+name: acp_delegation
+version: 1.0.0
+description: "Delegate a coding task to an external worker (Claude Code or pi) over the Agent Client Protocol, using the acpx CLI. One task per call, scoped to an operator-approved directory."
+author: "wego (ANYA-PATCH)"
+kind: standalone
+provides_tools:
+  - acp_delegate
