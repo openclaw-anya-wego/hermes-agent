@@ -128,9 +128,21 @@ def run(request: RunRequest, host_progress: Optional[HostProgress] = None) -> Ru
     # A named session, not a one-shot `exec`. The mode can only be set on a
     # session, and the mode is what decides whether the worker may run anything
     # at all — see _open_session.
+    #
+    # Closed on EVERY path out of here, including the two before the main try
+    # block below is entered. `_open_session` creates the session and then sets
+    # the mode as a second call, so a rejected mode raises with the session
+    # already created; `_spawn` can fail with it created AND configured. Both
+    # would otherwise leave an `acp-<uuid>` record behind per attempt, and the
+    # failure that causes it is the repeatable kind — an adapter that does not
+    # know the mode id fails identically every time.
     _open_session(request)
-    command = _build_command(request)
-    process = _spawn(command, request.working_directory)
+    try:
+        command = _build_command(request)
+        process = _spawn(command, request.working_directory)
+    except BaseException:
+        _close_session(request)
+        raise
 
     lease_path = _write_lease(
         request.lease_id, process.pid, request.worker, request.working_directory
@@ -276,11 +288,20 @@ def _open_session(request: RunRequest) -> None:
     )
     if not request.permission_mode:
         return
-    _control(
-        request,
-        [request.worker, "-s", session, "set-mode", request.permission_mode],
-        "acpx could not set the worker's mode to '{}'".format(request.permission_mode),
-    )
+    # The session already exists by this point, so a rejected mode must take it
+    # back down. acpx documents that an adapter rejects an unsupported mode id,
+    # and that failure repeats on every attempt — leaving the record behind
+    # would accumulate one dead session per delegation for as long as the
+    # misconfiguration lasts.
+    try:
+        _control(
+            request,
+            [request.worker, "-s", session, "set-mode", request.permission_mode],
+            "acpx could not set the worker's mode to '{}'".format(request.permission_mode),
+        )
+    except BaseException:
+        _close_session(request)
+        raise
 
 
 def _close_session(request: RunRequest) -> None:
@@ -577,30 +598,60 @@ class _ProgressRelay:
         self._status_due = _Throttle(ACTIVITY_INTERVAL_SECONDS)
         self._keep_alive_due = _Throttle(KEEP_ALIVE_INTERVAL_SECONDS)
         self._last_reported = None
+        self._last_reported_call_id = None
         self._latest_activity = None
 
     def consider(self, line: str) -> None:
         now = time.monotonic()
         activity = parse.activity_from_line(line)
-        if activity:
+        if activity is not None:
             self._latest_activity = activity
-            self._show_status(activity, now)
+        # Attempted on EVERY line, not only on the ones carrying an action. A
+        # throttled activity is held, not dropped, so something has to come back
+        # for it — and the next line of any kind is the cheapest trigger.
+        self._show_status(now)
         # Any line at all is evidence the worker is alive, including one this
         # plugin has no opinion about.
         self._keep_clock_warm(now)
 
-    def _show_status(self, activity: str, now: float) -> None:
-        if self._report_status is None or activity == self._last_reported:
+    def _show_status(self, now: float) -> None:
+        activity = self._latest_activity
+        if self._report_status is None or activity is None:
             return
-        if not self._status_due.due(now):
+        if activity.text == self._last_reported:
+            # Unchanged phrase, but not necessarily the same ACTION: claude
+            # opens every call with the same placeholder title, so two
+            # consecutive Bash calls are textually identical right here. Follow
+            # the newer call anyway. Returning without it leaves the id on the
+            # previous call, so the new one's real description is not recognised
+            # as a refinement and gets throttled — the exact case the bypass
+            # below exists for.
+            self._last_reported_call_id = activity.call_id
             return
-        self._last_reported = activity
-        self._report_status(activity)
+
+        # A REFINEMENT of the action already on the line bypasses the throttle.
+        # claude opens every tool call with an empty rawInput and a placeholder
+        # title, then names it properly a moment later — same toolCallId, ~200 ms
+        # apart. Throttling that leaves "Terminal" in front of the operator until
+        # the NEXT tool call, discarding "Show working tree status" entirely,
+        # which is what made every long delegation read as a wall of "Terminal".
+        # It is not flicker: it is one action being described correctly, and the
+        # text dedupe above already absorbs the repeats.
+        refines = (
+            activity.call_id is not None
+            and activity.call_id == self._last_reported_call_id
+        )
+        if not refines and not self._status_due.due(now):
+            return
+        self._last_reported = activity.text
+        self._last_reported_call_id = activity.call_id
+        self._report_status(activity.text)
 
     def _keep_clock_warm(self, now: float) -> None:
         if self._keep_alive is None or not self._keep_alive_due.due(now):
             return
-        self._keep_alive(self._latest_activity or UNNAMED_ACTIVITY)
+        latest = self._latest_activity
+        self._keep_alive(latest.text if latest else UNNAMED_ACTIVITY)
 
 
 def _read_stderr(process: subprocess.Popen, tail: deque) -> None:

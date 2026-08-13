@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 TRUNCATION_NOTICE = "\n\n… [truncated, kept {kept} of {total} chars]"
 
@@ -148,7 +148,19 @@ def consume_line(transcript: Transcript, raw_line: str) -> None:
         _consume_result(transcript, message.get("result"))
 
 
-def activity_from_line(raw_line: str) -> Optional[str]:
+class Activity(NamedTuple):
+    """One action, and the tool call it belongs to.
+
+    ``call_id`` is carried so a caller can tell a NEW action from a better
+    description of the one already on screen. Those need opposite treatment and
+    are indistinguishable from the text alone — see ``_ProgressRelay``.
+    """
+
+    call_id: Optional[str]
+    text: str
+
+
+def activity_from_line(raw_line: str) -> Optional[Activity]:
     """The worker's current action from one line, or None.
 
     Separate from ``consume_line`` so a caller wanting only the newest action
@@ -162,7 +174,11 @@ def activity_from_line(raw_line: str) -> Optional[str]:
     update = message.get("params", {}).get("update", {})
     if update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
         return None
-    return _activity_title(update)
+    title = _activity_title(update)
+    if title is None:
+        return None
+    call_id = update.get("toolCallId")
+    return Activity(call_id if isinstance(call_id, str) else None, title)
 
 
 def build_result(
@@ -344,6 +360,17 @@ def _activity_title(update: Dict[str, Any]) -> Optional[str]:
     """
     if update.get("status") == "completed":
         return None
+
+    # The worker's own one-line summary of the action, when it sent one. It
+    # WINS outright rather than being appended, because it is the only field
+    # written for a human: claude's Bash title is the raw command line —
+    # `grep -n "" /Users/…/bookings.ts | sed -n '64,98p'` — beside a
+    # description reading "Show working tree status". On a status line the
+    # sentence is worth more than the argv, and appending both gives neither.
+    described = _described_action(update)
+    if described:
+        return described
+
     title = update.get("title")
     if not isinstance(title, str) or not title.strip():
         return None
@@ -353,6 +380,22 @@ def _activity_title(update: Dict[str, Any]) -> Optional[str]:
     if detail and not _already_named(title, detail):
         return "{} {}".format(title, detail)
     return title
+
+
+def _described_action(update: Dict[str, Any]) -> Optional[str]:
+    """The adapter's human-readable summary of this call, or None.
+
+    Only ``rawInput.description``. Deliberately not a search across likely
+    field names: a wrong guess here does not fail, it quietly puts the wrong
+    string in front of an operator for the length of a 90-minute run.
+    """
+    raw_input = update.get("rawInput")
+    if not isinstance(raw_input, dict):
+        return None
+    description = raw_input.get("description")
+    if not isinstance(description, str) or not description.strip():
+        return None
+    return description.strip().splitlines()[0]
 
 
 def _activity_detail(update: Dict[str, Any]) -> Optional[str]:

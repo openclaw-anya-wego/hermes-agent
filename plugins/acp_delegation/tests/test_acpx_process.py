@@ -302,6 +302,103 @@ class StatusRelayTests(unittest.TestCase):
         self.assertEqual(self.reported, [])
 
 
+class StatusRefinementTests(unittest.TestCase):
+    """The same action, described properly a moment later.
+
+    Captured from acpx 0.13.0 driving claude-agent-acp 0.60.0: claude opens
+    EVERY tool call with an empty rawInput and a placeholder title, then names
+    it ~200 ms later under the same toolCallId. The throttle used to drop that
+    second event and never revisit it, so a 90-minute review showed "Terminal"
+    for its whole length while "Show working tree status" was on the wire.
+    """
+
+    def setUp(self):
+        self.reported = []
+        self.relay = acpx_process._ProgressRelay(report_status=self.reported.append)
+
+    def event(self, call_id, title, raw_input=None, kind="tool_call"):
+        return json.dumps(
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": kind,
+                        "toolCallId": call_id,
+                        "title": title,
+                        "rawInput": raw_input or {},
+                    }
+                },
+            }
+        )
+
+    def test_a_refinement_replaces_the_placeholder_at_once(self):
+        self.relay.consider(self.event("t1", "Terminal"))
+        self.relay.consider(
+            self.event(
+                "t1",
+                "git status --short",
+                {"command": "git status --short", "description": "Show working tree status"},
+                kind="tool_call_update",
+            )
+        )
+
+        self.assertEqual(self.reported, ["Terminal", "Show working tree status"])
+
+    def test_a_different_call_is_still_throttled(self):
+        """The bypass must not become a general licence to flicker."""
+        self.relay.consider(self.event("t1", "Terminal"))
+        self.relay.consider(self.event("t2", "Read a.java"))
+
+        self.assertEqual(self.reported, ["Terminal"])
+
+    def test_a_throttled_action_is_held_not_dropped(self):
+        """The other half: whatever the throttle blocks must still be shown."""
+        self.relay.consider(self.event("t1", "Read a.java"))
+        self.relay.consider(self.event("t2", "Edit b.java"))
+        self.assertEqual(self.reported, ["Read a.java"])
+
+        self.relay._status_due._next_at = 0.0
+        self.relay.consider('{"method":"session/update","params":{"update":'
+                            '{"sessionUpdate":"usage_update","used":1}}}')
+
+        self.assertEqual(self.reported, ["Read a.java", "Edit b.java"])
+
+    def test_the_second_call_with_the_same_placeholder_still_refines(self):
+        """The dedupe must follow the call, not only the phrase.
+
+        Two consecutive Bash calls both open as "Terminal", so the second is
+        absorbed by the text dedupe. If that path forgets to advance the call
+        id, the second call's real description is measured against the FIRST
+        call's id, reads as a new action, and gets throttled — silently undoing
+        the bypass for every tool call after the first.
+        """
+        self.relay.consider(self.event("t1", "Terminal"))
+        self.relay.consider(self.event("t2", "Terminal"))
+        self.relay.consider(
+            self.event(
+                "t2",
+                "gh pr view 1504",
+                {"command": "gh pr view 1504", "description": "Get PR #1504 metadata"},
+                kind="tool_call_update",
+            )
+        )
+
+        self.assertEqual(self.reported, ["Terminal", "Get PR #1504 metadata"])
+
+    def test_a_repeated_refinement_does_not_report_twice(self):
+        """claude sends the description twice — once alone, once with content."""
+        described = self.event(
+            "t1",
+            "git status --short",
+            {"command": "git status --short", "description": "Show working tree status"},
+            kind="tool_call_update",
+        )
+        self.relay.consider(described)
+        self.relay.consider(described)
+
+        self.assertEqual(self.reported, ["Show working tree status"])
+
+
 class KeepAliveTests(unittest.TestCase):
     """The activity clock, which is a liveness proof rather than a status.
 
@@ -553,6 +650,21 @@ class SessionModeTests(ProcessTestCase):
             self.run_task(binary)
 
         self.assertIn("mode", str(caught.exception))
+
+    def test_a_failed_mode_change_still_closes_the_session(self):
+        """The session exists by then, and this failure repeats every time.
+
+        An adapter that does not know the mode id rejects it identically on
+        every delegation, so leaving the record behind accumulates one dead
+        session per attempt for as long as the misconfiguration lasts.
+        """
+        binary, log = self.recording_acpx(mode_exit=1)
+
+        with self.assertRaises(acpx_process.SpawnError):
+            self.run_task(binary)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions close acp-" in c for c in calls), calls)
 
     def test_the_session_name_carries_the_run_id(self):
         """The lease, the settings overlay and the session share one id, so the
