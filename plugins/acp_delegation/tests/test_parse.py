@@ -95,11 +95,68 @@ def permission_request(kind="edit", path="/tmp/work/hello.txt"):
     )
 
 
+def available_commands(*names):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {"name": name, "description": "does {}".format(name)} for name in names
+                    ],
+                }
+            },
+        }
+    )
+
+
 def transcript_from(lines):
     transcript = Transcript()
     for line in lines:
         consume_line(transcript, line)
     return transcript
+
+
+class AvailableCommandsTests(unittest.TestCase):
+    """The command list is what tells a typo'd command from a real one."""
+
+    def test_collects_the_advertised_command_names(self):
+        transcript = transcript_from([available_commands("deploy-mini", "saber-code-review")])
+
+        self.assertEqual(
+            transcript.available_commands, ["deploy-mini", "saber-code-review"]
+        )
+
+    def test_is_empty_when_the_worker_never_advertised_any(self):
+        """Callers must fail open on this — it is silence, not an empty catalogue."""
+        transcript = transcript_from([chunk("hello"), final_result()])
+
+        self.assertEqual(transcript.available_commands, [])
+
+    def test_replaces_rather_than_accumulates_on_a_second_event(self):
+        """The adapter pushes the full list whenever it changes."""
+        transcript = transcript_from(
+            [available_commands("old-one"), available_commands("new-one", "another")]
+        )
+
+        self.assertEqual(transcript.available_commands, ["new-one", "another"])
+
+    def test_survives_a_malformed_command_entry(self):
+        line = json.dumps(
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": ["not-an-object", {"description": "no name"}],
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(transcript_from([line]).available_commands, [])
 
 
 class ConsumeLineTests(unittest.TestCase):

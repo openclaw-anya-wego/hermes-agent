@@ -20,13 +20,14 @@ sys.path.insert(0, REPO_ROOT)
 from plugins.acp_delegation import acpx_process, parse, tools  # noqa: E402
 
 
-def outcome(text="done", exit_code=0, output_tokens=5):
+def outcome(text="done", exit_code=0, output_tokens=5, available_commands=None):
     transcript = parse.Transcript()
     if text:
         transcript.text_fragments.append(text)
     transcript.saw_final_result = True
     transcript.stop_reason = "end_turn"
     transcript.usage = parse.Usage(output_tokens=output_tokens, total_tokens=31206)
+    transcript.available_commands = list(available_commands or [])
     return acpx_process.RunOutcome(transcript, exit_code, "")
 
 
@@ -179,6 +180,60 @@ class CommandTests(HandlerTestCase):
         self.delegate(command="not a command")
 
         self.assertEqual(self.calls, [])
+
+
+class UnknownCommandTests(HandlerTestCase):
+    """A command the worker does not have fails nowhere on its own.
+
+    It arrives as ordinary prose, the worker improvises around it and exits 0,
+    and the reply is indistinguishable from one that followed the procedure.
+    """
+
+    def test_fails_a_command_the_worker_never_advertised(self):
+        self.stub_run(outcome(available_commands=["deploy-mini", "saber-code-review"]))
+
+        result = self.delegate(command="/saber-code-reviw #1")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "unknown_command")
+
+    def test_names_the_commands_that_do_exist(self):
+        self.stub_run(outcome(available_commands=["deploy-mini", "saber-code-review"]))
+
+        result = self.delegate(command="/saber-code-reviw #1")
+
+        self.assertIn("saber-code-review", result["error"])
+        self.assertEqual(result["available_commands"], ["deploy-mini", "saber-code-review"])
+
+    def test_keeps_the_reply_so_the_work_is_not_lost(self):
+        self.stub_run(outcome(text="I rewrote the parser", available_commands=["other"]))
+
+        result = self.delegate(command="/missing")
+
+        self.assertEqual(result["response"], "I rewrote the parser")
+
+    def test_accepts_a_command_the_worker_advertised(self):
+        self.stub_run(outcome(available_commands=["saber-code-review"]))
+
+        result = self.delegate(command="/saber-code-review #1234")
+
+        self.assertTrue(result["success"])
+
+    def test_ignores_the_arguments_when_matching(self):
+        self.stub_run(outcome(available_commands=["deploy-mini"]))
+
+        self.assertTrue(self.delegate(command="/deploy-mini --dry-run")["success"])
+
+    def test_fails_open_when_the_worker_advertised_nothing(self):
+        """Silence is not evidence of absence — pi may never send the event."""
+        self.stub_run(outcome(available_commands=[]))
+
+        self.assertTrue(self.delegate(command="/anything")["success"])
+
+    def test_does_not_second_guess_a_run_that_already_failed(self):
+        self.stub_run(outcome(text="", output_tokens=0, available_commands=["other"]))
+
+        self.assertEqual(self.delegate(command="/missing")["error_type"], "false_success")
 
 
 class SuccessTests(HandlerTestCase):

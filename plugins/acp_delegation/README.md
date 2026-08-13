@@ -112,10 +112,21 @@ named `agent` would promise something only prose could attempt, and this plugin
 already refuses that shape once — see `_deny_rules_for`.
 
 Commands resolve from the project, so one that exists in a given checkout may not
-exist in another. The plugin cannot tell: an unexpandable command is pasted into
-the prompt verbatim and improvised around, which reads as success. The session
-does emit `available_commands_update`, so detecting this is possible — it is not
-implemented.
+exist in another. A command the worker does not have fails nowhere on its own: it
+arrives as ordinary prose, the worker improvises around it and exits 0, and the
+reply is indistinguishable from one that followed the procedure.
+
+So the plugin checks. The worker advertises its commands over ACP
+(`available_commands_update`), the parser collects them, and a run whose command
+is not in that list comes back `success: false` with
+`error_type: "unknown_command"`, the names that do exist, and the worker's reply
+kept so the work is not lost. This is the same judgement as `false_success`: a
+reply produced without the procedure that was asked for is not a success, however
+plausible it reads.
+
+It **fails open when the worker advertised nothing**. An empty list means the
+worker never said, which is not evidence it has no commands — pi may never send
+the event at all.
 
 ## Two permission layers, because one is not enough
 
@@ -207,6 +218,7 @@ writes, so a total-token guard can never fire. `tests/test_parse.py` pins this.
 | `interrupted` | acpx exit 130. |
 | `malformed_output` | Clean exit with no final result. The output cannot be trusted. |
 | `false_success` | Reported completion, did nothing. |
+| `unknown_command` | The worker has no such command. It improvised; the reply is not the procedure. |
 | `unknown_exit` | An exit code acpx does not document. |
 
 ## Restart safety

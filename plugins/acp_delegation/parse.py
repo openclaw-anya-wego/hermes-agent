@@ -86,6 +86,9 @@ class Transcript:
     cost_amount: Optional[float] = None
     cost_currency: Optional[str] = None
     saw_final_result: bool = False
+    # Slash commands the worker advertised. Empty means it never said — which is
+    # not the same as "it has none", so callers must fail open on an empty list.
+    available_commands: List[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -262,6 +265,24 @@ def _consume_session_update(transcript: Transcript, update: Dict[str, Any]) -> N
         return
     if kind == "usage_update":
         _consume_cost(transcript, update.get("cost"))
+        return
+    if kind == "available_commands_update":
+        _consume_available_commands(transcript, update.get("availableCommands"))
+
+
+def _consume_available_commands(transcript: Transcript, commands: Any) -> None:
+    """Replace the command list rather than extending it.
+
+    The adapter pushes the *full* list whenever it changes, so appending would
+    accumulate duplicates and keep names that a mid-session change removed.
+    """
+    if not isinstance(commands, list):
+        return
+    transcript.available_commands = [
+        command["name"]
+        for command in commands
+        if isinstance(command, dict) and isinstance(command.get("name"), str)
+    ]
 
 
 def _consume_cost(transcript: Transcript, cost: Optional[Dict[str, Any]]) -> None:

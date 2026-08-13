@@ -273,6 +273,8 @@ def _format(
         # call site alone.
         result["command"] = request["command"]
 
+    result = _flag_unknown_command(result, request["command"], outcome.transcript)
+
     # tool_result accepts a dict or keyword arguments, never both, so "success"
     # has to travel inside the payload rather than alongside it.
     if result.get("success"):
@@ -280,6 +282,50 @@ def _format(
 
     message = result.pop("error", "The delegation failed.")
     return tool_error(message, **result)
+
+
+# How many command names to list back when one is not found. Enough to correct a
+# typo; not the worker's whole catalogue, which can run to dozens.
+_SUGGESTION_LIMIT = 20
+
+
+def _flag_unknown_command(
+    result: Dict[str, Any], command: Optional[str], transcript: parse.Transcript
+) -> Dict[str, Any]:
+    """Fail a run whose command the worker never had.
+
+    An unexpandable slash command is not an error anywhere: the worker receives
+    it as ordinary prose, improvises something plausible around it, and exits
+    cleanly. The requested procedure never ran, and the reply reads exactly like
+    one that followed it — the same false confidence ``false_success`` exists to
+    catch, and the reason this is a failure rather than a warning.
+
+    Fails open when the worker advertised nothing. An empty list means it never
+    said, which is not evidence that it has no commands, and guessing the other
+    way would break every worker whose adapter does not send the event.
+    """
+    if not command or not result.get("success") or not transcript.available_commands:
+        return result
+
+    name = command.lstrip("/").split()[0]
+    if name in transcript.available_commands:
+        return result
+
+    known = sorted(transcript.available_commands)
+    flagged = dict(result)
+    flagged["success"] = False
+    flagged["error_type"] = "unknown_command"
+    flagged["error"] = (
+        "The worker has no command '{}'. It read the request as plain text, so the "
+        "procedure you asked for did not run and the reply below is improvised. "
+        "Commands it does have: {}{}.".format(
+            command.split()[0],
+            ", ".join(known[:_SUGGESTION_LIMIT]),
+            "" if len(known) <= _SUGGESTION_LIMIT else ", …",
+        )
+    )
+    flagged["available_commands"] = known
+    return flagged
 
 
 def _deny_rules_for(worker: str) -> List[str]:
