@@ -78,6 +78,31 @@ The mini has 16 GB of RAM. The box is oversubscribed.
 Hermes needs about 400 MB to 700 MB for two Python processes.
 Free memory before you start Hermes. A reboot clears the swap and the accumulated leaks.
 
+## Additions on this branch
+
+Local code that is not a patch. It fixes nothing upstream and will never be sent
+there, so it does not belong in the patch list below.
+
+### `plugins/acp_delegation/`
+
+Lets Hermes delegate a coding task to the Claude Code worker or pi over the
+Agent Client Protocol, by calling the `acpx` CLI. Migration stage 5.
+
+Hermes cannot do this on its own. `hermes acp` runs Hermes **as** an ACP server
+for an editor to drive; delegating outward needs an ACP *client*, which upstream
+issue NousResearch/hermes-agent#5257 proposes and has not built. That issue
+would also not solve this: it is shaped as a *provider* shim — running Hermes on
+Claude Code as a model — rather than handing a task to Claude Code's own agent
+loop. The existing `copilot_acp_client.py` is a provider shim of exactly that
+kind.
+
+Enable with `hermes plugins enable acp_delegation`; a bundled standalone plugin
+is still opt-in (`hermes_cli/plugins.py:1468`). It refuses to run until
+`plugins.entries.acp_delegation.allowed_cwd_roots` is set.
+
+See `plugins/acp_delegation/README.md` for configuration, the two permission
+layers, and the error taxonomy.
+
 ## Patches on this branch
 
 Each patch carries a fix that is already open upstream. Delete the patch when
