@@ -148,7 +148,7 @@ def _spawn(command: List[str], working_directory: str) -> subprocess.Popen:
             # then look like a hang rather than an encoding fault.
             errors="replace",
             bufsize=1,
-            env=os.environ.copy(),
+            env=_build_environment(),
         )
     except FileNotFoundError:
         raise SpawnError(
@@ -158,6 +158,25 @@ def _spawn(command: List[str], working_directory: str) -> subprocess.Popen:
         )
     except OSError as error:
         raise SpawnError("Could not start acpx: {}".format(error), "spawn_failed")
+
+
+def _build_environment() -> Dict[str, str]:
+    """The worker's environment: ours, plus the user-scope opt-in.
+
+    acpx defaults Claude Code's setting sources to ``["project", "local"]`` and
+    drops ``user`` unless ``ACPX_CLAUDE_INCLUDE_USER_SETTINGS=1``. That default
+    silently removes everything under ``~/.claude`` — including
+    ``~/.claude/commands``, which is where the operator's delegation commands
+    live. The symptom is not an error: the worker answers ``Unknown command:
+    /saber-code-review`` at exit 0, having improvised on the brief instead.
+
+    Anya's path does not hit this because OpenClaw's acpx *extension* drives the
+    adapter directly and gets its default of ``["user", "project", "local"]``.
+    Reaching the same worker through the acpx CLI does not.
+    """
+    environment = os.environ.copy()
+    environment["ACPX_CLAUDE_INCLUDE_USER_SETTINGS"] = "1"
+    return environment
 
 
 def _start_writer(process: subprocess.Popen, task: str) -> threading.Thread:

@@ -199,6 +199,23 @@ class CommandTests(ProcessTestCase):
         self.assertEqual(json.loads(command[command.index("--permission-policy") + 1]), KIND_POLICY)
         self.assertEqual(command[command.index("--cwd") + 1], "/tmp/repo")
 
+    def test_opts_into_the_user_setting_source(self):
+        """Without this, ~/.claude/commands is invisible to the worker.
+
+        acpx defaults Claude Code to ["project", "local"], so a delegation
+        naming an operator-installed command comes back "Unknown command: …" at
+        exit 0 — improvised, not failed.
+        """
+        environment = acpx_process._build_environment()
+
+        self.assertEqual(environment["ACPX_CLAUDE_INCLUDE_USER_SETTINGS"], "1")
+
+    def test_keeps_the_rest_of_the_environment(self):
+        os.environ["ACP_TEST_MARKER"] = "kept"
+        self.addCleanup(os.environ.pop, "ACP_TEST_MARKER", None)
+
+        self.assertEqual(acpx_process._build_environment()["ACP_TEST_MARKER"], "kept")
+
     def test_sends_the_task_over_stdin_rather_than_argv(self):
         """Argv quoting and length limits are not worth risking on a prompt."""
         command = acpx_process._build_command("acpx", "claude", "/tmp/repo", 300, KIND_POLICY)
