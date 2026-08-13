@@ -131,17 +131,22 @@ doing. Expect conflicts here on an upstream merge:
 | `tools/environments/base.py` | `set_status_callback` / `get_status_callback`, thread-local, mirroring the activity pair beside them |
 | `agent/tool_executor.py` | registers one per tool call, pointed at that tool's name |
 | `gateway/run.py` | renders a `tool.status` event verbatim onto the live status line |
-| `plugins/platforms/slack/adapter.py` | sends the phrase to `loading_messages` as well as `status` |
+| `plugins/platforms/slack/adapter.py` | sends the phrase to `loading_messages` instead of `status` |
 
 That last one is a separate bug, found by looking at a screenshot. Slack shows
 **two** indicators while an AI app works, fed by two arguments of the same call:
 `status` is the line beneath the reply composer, and `loading_messages` is the
 indicator inline in the message list. Hermes only ever sent `status`, so the
 inline one fell back to Slack's own rotating placeholders — "Processing…",
-"Searching…" — which say nothing about what the agent is doing and read as
-generic beside a status line naming the file. The upstream docs asserted those
-placeholders were Slack's and uncontrollable; they are not, and that note is
-corrected in `website/docs/user-guide/messaging/slack.md`.
+"Searching…" — which say nothing about what the agent is doing. The upstream
+docs asserted those placeholders were Slack's and uncontrollable; they are not,
+and that note is corrected in `website/docs/user-guide/messaging/slack.md`.
+
+The phrase now goes to `loading_messages` only, with `status` left blank. Both
+put the same sentence on screen a few centimetres apart, and the inline one wins
+on placement — it sits with the conversation, where the composer footer is easy
+to miss. The rejection fallback still writes `status`, because one surface in
+the wrong place beats none.
 
 The status line is otherwise rendered once, from the tool name, when a tool
 starts. That suits a tool returning in seconds and fails one that blocks for an

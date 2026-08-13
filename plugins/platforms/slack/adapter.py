@@ -2963,24 +2963,29 @@ class SlackAdapter(BasePlatformAdapter):
           status           the line beneath the reply composer
           loading_messages the indicator INLINE in the message list
 
-        Passing only ``status`` leaves the inline one to Slack's own rotating
-        placeholders — "Processing…", "Searching..." — which say nothing about
-        what this agent is actually doing, and which read as generic next to a
-        status line that names the file. One message rather than several: these
-        are progress, and rotating flavour text over real progress is a
-        downgrade.
+        Only the inline one is used. Sending the phrase to both puts the same
+        sentence on screen twice, a few centimetres apart, and the inline one
+        wins on placement: it sits with the conversation the operator is already
+        reading, where the composer footer is easy to miss entirely.
+
+        Passing no ``loading_messages`` at all is what leaves the inline
+        indicator to Slack's own rotating placeholders — "Processing…",
+        "Searching…" — which say nothing about what this agent is doing.
 
         The retry is not defensive habit. The whole call sits inside a bare
         ``except`` that falls back to reactions, so a workspace or SDK that
-        rejects ``loading_messages`` would silently lose the composer line too —
-        trading a working surface for a new one.
+        rejects ``loading_messages`` would otherwise leave NO status at all —
+        and the fallback deliberately restores the composer line, because one
+        surface in the wrong place beats none.
         """
         client = self._get_client(chat_id, team_id=team_id)
         try:
             await client.assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
-                status=status,
+                # Blank, so the composer footer stays empty and the phrase
+                # appears once. The argument is required by the method.
+                status="",
                 loading_messages=[status],
             )
         except Exception as e:
