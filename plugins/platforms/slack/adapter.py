@@ -885,10 +885,13 @@ class SlackAdapter(BasePlatformAdapter):
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
     # ANYA-PATCH. What the composer footer says while the inline indicator
-    # carries the live phrase. Deliberately constant and deliberately NOT empty:
-    # an empty status is the clear signal, and sending one here shows nothing at
-    # all on either surface.
-    WORKING_STATUS = "is working…"
+    # carries the live phrase. The footer is where Slack shows "<name> is
+    # typing…" for a person, so the agent says the same thing there and reads as
+    # an ordinary participant; what it is actually doing goes inline.
+    #
+    # Deliberately constant, and deliberately NOT empty: an empty status is the
+    # clear signal, and sending one here shows nothing on either surface.
+    WORKING_STATUS = "is typing..."
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
