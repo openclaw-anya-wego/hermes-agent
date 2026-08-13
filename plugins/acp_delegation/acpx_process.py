@@ -674,22 +674,41 @@ def _close_pipes(process: subprocess.Popen) -> None:
 
 
 def _write_lease(lease_id: str, pid: int, worker: str, working_directory: str) -> Optional[str]:
+    """Publish this delegation's child pid where ``safe-restart.sh`` will find it.
+
+    Written to a sibling temp file and renamed, never opened in place. The reader
+    is a shell ``sed`` that cannot distinguish a half-written lease from a
+    corrupt one, and it answers "unreadable" by aborting the restart — so a
+    truncating ``open(path, "w")`` that lost the process before the flush would
+    leave a zero-byte file blocking every restart from then on, with no owner
+    left alive to clean it up. ``os.replace`` is atomic within a directory, so a
+    concurrent reader sees either no lease or a complete one.
+
+    The temp file deliberately ends in ``.tmp``: the reader globs ``*.json``, and
+    a temp name it could match would reintroduce the same partial read.
+    """
     directory = lease_directory()
+    path = os.path.join(directory, "{}.json".format(lease_id))
+    staging = "{}.tmp".format(path)
     try:
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, "{}.json".format(lease_id))
         payload = {
             "pid": pid,
             "worker": worker,
             "cwd": working_directory,
             "started_at": time.time(),
         }
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(staging, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+        os.replace(staging, path)
         return path
     except OSError:
         # A missing lease weakens the restart guard but must never fail the
         # delegation the operator actually asked for.
+        try:
+            os.remove(staging)
+        except OSError:
+            pass
         return None
 
 

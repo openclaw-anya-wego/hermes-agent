@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -208,6 +209,32 @@ class LeaseTests(ProcessTestCase):
         outcome = self.run_task(self.fake_worker())
 
         self.assertEqual(outcome.exit_code, 0)
+
+    def test_leaves_no_staging_file_for_the_reader_to_trip_over(self):
+        acpx_process._write_lease("abc123", 4242, "claude", "/tmp/repo")
+
+        self.assertEqual(os.listdir(acpx_process.lease_directory()), ["abc123.json"])
+
+    def test_a_write_that_dies_mid_flush_publishes_no_lease(self):
+        """The reason the write is a rename rather than an in-place truncate.
+
+        safe-restart.sh aborts on a lease it cannot parse, and nothing reaps one
+        whose owner is gone — so a zero-byte file here blocks every future
+        restart of the gateway, permanently and by hand-repair only.
+        """
+        directory = acpx_process.lease_directory()
+        os.makedirs(directory, exist_ok=True)
+
+        def die_mid_write(*_args, **_kwargs):
+            raise OSError("killed between truncate and flush")
+
+        with mock.patch.object(acpx_process.json, "dump", die_mid_write):
+            path = acpx_process._write_lease("abc123", 4242, "claude", "/tmp/repo")
+
+        self.assertIsNone(path)
+        self.assertEqual(
+            [name for name in os.listdir(directory) if name.endswith(".json")], []
+        )
 
 
 class StatusRelayTests(unittest.TestCase):
