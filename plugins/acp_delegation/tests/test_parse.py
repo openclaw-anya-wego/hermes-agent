@@ -119,6 +119,65 @@ def transcript_from(lines):
     return transcript
 
 
+def tool_call(title="Read FareParser.java", status="in_progress", kind="tool_call"):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": kind,
+                    "toolCallId": "t1",
+                    "title": title,
+                    "status": status,
+                }
+            },
+        }
+    )
+
+
+class ActivityTests(unittest.TestCase):
+    """What the worker is doing, for a call that blocks up to 90 minutes."""
+
+    def test_records_the_workers_own_wording(self):
+        transcript = transcript_from([tool_call("Run bun test")])
+
+        self.assertEqual(transcript.last_activity, "Run bun test")
+
+    def test_keeps_only_the_newest_action(self):
+        transcript = transcript_from(
+            [tool_call("Read a.java"), tool_call("Edit b.java")]
+        )
+
+        self.assertEqual(transcript.last_activity, "Edit b.java")
+
+    def test_ignores_a_completed_update(self):
+        """Otherwise the finished step is reported while the next one runs."""
+        transcript = transcript_from(
+            [tool_call("Read a.java"), tool_call("Read a.java", status="completed")]
+        )
+
+        self.assertEqual(transcript.last_activity, "Read a.java")
+
+    def test_follows_a_tool_call_update(self):
+        transcript = transcript_from([tool_call("Editing", kind="tool_call_update")])
+
+        self.assertEqual(transcript.last_activity, "Editing")
+
+    def test_is_absent_before_the_worker_does_anything(self):
+        self.assertIsNone(transcript_from([chunk("hi")]).last_activity)
+
+    def test_survives_a_titleless_call(self):
+        line = json.dumps(
+            {
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "tool_call", "status": "in_progress"}},
+            }
+        )
+
+        self.assertIsNone(transcript_from([line]).last_activity)
+
+
 class AvailableCommandsTests(unittest.TestCase):
     """The command list is what tells a typo'd command from a real one."""
 

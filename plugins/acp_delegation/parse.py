@@ -89,6 +89,10 @@ class Transcript:
     # Slash commands the worker advertised. Empty means it never said — which is
     # not the same as "it has none", so callers must fail open on an empty list.
     available_commands: List[str] = field(default_factory=list)
+    # The worker's most recent action, for progress reporting. A delegation
+    # blocks for up to 90 minutes, so without this the host has no evidence the
+    # run is alive and cannot tell a working worker from a hung one.
+    last_activity: Optional[str] = None
 
     @property
     def text(self) -> str:
@@ -268,6 +272,28 @@ def _consume_session_update(transcript: Transcript, update: Dict[str, Any]) -> N
         return
     if kind == "available_commands_update":
         _consume_available_commands(transcript, update.get("availableCommands"))
+        return
+    if kind in ("tool_call", "tool_call_update"):
+        _consume_activity(transcript, update)
+
+
+def _consume_activity(transcript: Transcript, update: Dict[str, Any]) -> None:
+    """Record what the worker is doing, in its own words.
+
+    The adapter's ``title`` is already written for a human ("Read
+    FareParser.java", "Run bun test") — better than anything this module could
+    synthesise from the raw tool name and arguments, and it is the same field an
+    editor would display.
+
+    Only ``in_progress`` and untagged calls count. A ``completed`` update would
+    report the previous action as the current one for however long the next step
+    takes, which reads as a stall precisely when the worker is busiest.
+    """
+    if update.get("status") == "completed":
+        return
+    title = update.get("title")
+    if isinstance(title, str) and title.strip():
+        transcript.last_activity = title.strip()
 
 
 def _consume_available_commands(transcript: Transcript, commands: Any) -> None:
