@@ -221,6 +221,35 @@ writes, so a total-token guard can never fire. `tests/test_parse.py` pins this.
 | `unknown_command` | The worker has no such command. It improvised; the reply is not the procedure. |
 | `unknown_exit` | An exit code acpx does not document. |
 
+## Progress while it runs
+
+This call blocks for as long as the delegation takes — up to 90 minutes. Without
+progress the host sees one tool call and no activity, and cannot tell a working
+worker from a hung one.
+
+So the stdout reader watches the worker's `tool_call` and `tool_call_update`
+events and reports the newest one to the host's activity callback as
+`claude worker: Run bun test`. The adapter's own `title` is used verbatim: it is
+already written for a human, and it is the same string an editor would display.
+
+- **At most one report per 5 s**, and never the same action twice. A worker doing
+  ten things a second would otherwise turn the status line into a flicker.
+- **`completed` updates are ignored.** Reporting a finished step would show it
+  for however long the next one takes — reading as a stall exactly when the
+  worker is busiest.
+- **Entirely optional.** No host callback means no reporting; the tests run this
+  path offline.
+
+The callback is captured on the handler's thread, because the host's is
+thread-local and a reader thread cannot look it up for itself
+(`get_activity_callback` exists for this handoff). Failures are swallowed: an
+exception on the stdout reader would stop the only thread draining that pipe and
+hang the worker on a full buffer — a hang caused by the code proving there is
+none.
+
+Both workers are covered. `pi` emits the same ACP events, so nothing here is
+claude-specific.
+
 ## Restart safety
 
 While a task runs, the plugin writes a lease file:

@@ -36,6 +36,12 @@ STDERR_TAIL_LINES = 40
 POLL_INTERVAL_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 2
 
+# How often the worker's current action is reported to the host. The host
+# rate-limits its own persistence, so this only needs to be often enough that a
+# reader sees movement, and rare enough that a chatty worker cannot turn the
+# status line into a flicker.
+ACTIVITY_INTERVAL_SECONDS = 5
+
 LEASE_DIRECTORY = os.path.join("runtime", "acp_delegation", "active")
 
 
@@ -82,7 +88,11 @@ def run(
         # blocks in write() while acpx blocks writing output nobody is draining.
         # That happens before the deadline loop below is armed, so nothing would
         # ever time it out.
-        readers = _start_readers(process, stdout_lines, stderr_tail)
+        # Captured here, on the handler's thread. The host's activity callback
+        # is thread-local, so a reader thread cannot look it up for itself —
+        # get_activity_callback exists for exactly this handoff.
+        report_activity = _capture_activity_reporter(worker)
+        readers = _start_readers(process, stdout_lines, stderr_tail, report_activity)
         writer = _start_writer(process, task)
         transcript, exit_code = _collect(
             process, stdout_lines, timeout_seconds + grace_seconds
@@ -208,10 +218,41 @@ def _stderr_text(tail: deque) -> str:
     return "".join(list(tail)).strip()
 
 
+def _capture_activity_reporter(worker: str):
+    """A callable that tells the host what the worker is doing, or None.
+
+    Returns None when Hermes is absent — the tests run without it — or when the
+    host registered no callback, so progress reporting stays entirely optional.
+
+    Reporting matters more here than for an ordinary tool. This call blocks for
+    as long as the delegation runs, up to 90 minutes, and a host that sees no
+    activity for that long cannot distinguish a working worker from a hung one.
+    """
+    try:
+        from tools.environments.base import get_activity_callback
+
+        callback = get_activity_callback()
+    except Exception:
+        return None
+    if callback is None:
+        return None
+
+    def report(activity: str) -> None:
+        try:
+            callback("{} worker: {}".format(worker, activity))
+        except Exception:
+            # Progress is a courtesy. A host that raises here must not take the
+            # delegation down with it.
+            pass
+
+    return report
+
+
 def _start_readers(
     process: subprocess.Popen,
     stdout_lines: "queue.Queue[Optional[str]]",
     stderr_tail: deque,
+    report_activity=None,
 ) -> List[threading.Thread]:
     """Drain both pipes concurrently.
 
@@ -219,7 +260,11 @@ def _start_readers(
     while this side waits on stdout.
     """
     readers = [
-        threading.Thread(target=_read_stdout, args=(process, stdout_lines), daemon=True),
+        threading.Thread(
+            target=_read_stdout,
+            args=(process, stdout_lines, report_activity),
+            daemon=True,
+        ),
         threading.Thread(target=_read_stderr, args=(process, stderr_tail), daemon=True),
     ]
     for reader in readers:
@@ -227,20 +272,66 @@ def _start_readers(
     return readers
 
 
-def _read_stdout(process: subprocess.Popen, lines: "queue.Queue[Optional[str]]") -> None:
+def _read_stdout(
+    process: subprocess.Popen,
+    lines: "queue.Queue[Optional[str]]",
+    report_activity=None,
+) -> None:
     """Drain stdout, and always post the sentinel.
 
     A reader that dies without posting it would leave the collector waiting for
     output that can never arrive, which reads as a hung worker rather than a
     broken pipe.
+
+    Progress is derived here rather than in the collector because this thread
+    sees every line as it arrives. The collector is free to fall behind, and a
+    status report that lags the worker is worse than none.
     """
+    reporter = _ActivityThrottle(report_activity)
     try:
         for line in process.stdout:
             lines.put(line)
+            reporter.consider(line)
     except (OSError, ValueError):
         pass
     finally:
         lines.put(None)
+
+
+class _ActivityThrottle:
+    """Reports the worker's current action, no more than one report per window.
+
+    Keeps its own throwaway transcript: this thread only needs the newest
+    activity line, and folding into the real transcript from here would race the
+    collector that owns it.
+    """
+
+    def __init__(self, report):
+        self._report = report
+        self._transcript = parse.Transcript()
+        self._last_reported = None
+        self._next_report_at = 0.0
+
+    def consider(self, line: str) -> None:
+        if self._report is None:
+            return
+        parse.consume_line(self._transcript, line)
+        activity = self._transcript.last_activity
+        if not activity or activity == self._last_reported:
+            return
+        now = time.monotonic()
+        if now < self._next_report_at:
+            return
+        self._last_reported = activity
+        self._next_report_at = now + ACTIVITY_INTERVAL_SECONDS
+        try:
+            self._report(activity)
+        except Exception:
+            # This runs on the stdout reader. An exception escaping here kills
+            # the only thread draining that pipe, and the worker then blocks
+            # forever on a full buffer — a hang caused entirely by the code that
+            # exists to prove there is no hang.
+            pass
 
 
 def _read_stderr(process: subprocess.Popen, tail: deque) -> None:

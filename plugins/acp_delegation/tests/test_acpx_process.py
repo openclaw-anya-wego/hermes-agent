@@ -190,6 +190,104 @@ class LeaseTests(ProcessTestCase):
         self.assertEqual(outcome.exit_code, 0)
 
 
+class ActivityThrottleTests(unittest.TestCase):
+    """Progress reporting from the reader thread.
+
+    Exercised directly rather than through a subprocess: the throttle is where
+    the rate limiting and de-duplication live, and both are invisible in an
+    end-to-end run.
+    """
+
+    def setUp(self):
+        self.reported = []
+        self.throttle = acpx_process._ActivityThrottle(self.reported.append)
+
+    def line(self, title, status="in_progress"):
+        return json.dumps(
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "title": title,
+                        "status": status,
+                    }
+                },
+            }
+        )
+
+    def test_reports_the_first_action_immediately(self):
+        self.throttle.consider(self.line("Read a.java"))
+
+        self.assertEqual(self.reported, ["Read a.java"])
+
+    def test_throttles_a_chatty_worker(self):
+        """A worker doing ten things a second must not flicker the status."""
+        for index in range(10):
+            self.throttle.consider(self.line("Step {}".format(index)))
+
+        self.assertEqual(self.reported, ["Step 0"])
+
+    def test_reports_again_once_the_window_passes(self):
+        self.throttle.consider(self.line("Read a.java"))
+        self.throttle._next_report_at = 0.0
+
+        self.throttle.consider(self.line("Edit b.java"))
+
+        self.assertEqual(self.reported, ["Read a.java", "Edit b.java"])
+
+    def test_does_not_repeat_an_unchanged_action(self):
+        self.throttle.consider(self.line("Read a.java"))
+        self.throttle._next_report_at = 0.0
+
+        self.throttle.consider(self.line("Read a.java"))
+
+        self.assertEqual(self.reported, ["Read a.java"])
+
+    def test_is_inert_without_a_reporter(self):
+        """No host callback means no reporting, and certainly no crash."""
+        silent = acpx_process._ActivityThrottle(None)
+
+        silent.consider(self.line("Read a.java"))
+
+    def test_ignores_a_line_that_is_not_json(self):
+        self.throttle.consider("not json at all\n")
+
+        self.assertEqual(self.reported, [])
+
+
+class ActivityReporterTests(ProcessTestCase):
+    def test_is_none_when_the_host_offers_no_callback(self):
+        """The tests run without Hermes, so this is also the offline path."""
+        self.assertIsNone(acpx_process._capture_activity_reporter("claude"))
+
+    def test_a_raising_host_callback_cannot_kill_the_reader(self):
+        """This runs on the only thread draining stdout.
+
+        An exception escaping here stops that drain, the worker blocks on a full
+        pipe, and the run hangs — caused by the code meant to prove it has not.
+        """
+        def explode(_):
+            raise RuntimeError("host is unhappy")
+
+        throttle = acpx_process._ActivityThrottle(explode)
+
+        throttle.consider(
+            json.dumps(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "title": "x",
+                            "status": "in_progress",
+                        }
+                    },
+                }
+            )
+        )
+
+
 class CommandTests(ProcessTestCase):
     def test_passes_the_policy_and_cwd_to_acpx(self):
         command = acpx_process._build_command("acpx", "pi", "/tmp/repo", 300, KIND_POLICY)
