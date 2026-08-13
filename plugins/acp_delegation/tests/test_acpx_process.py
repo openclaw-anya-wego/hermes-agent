@@ -256,6 +256,61 @@ class ActivityThrottleTests(unittest.TestCase):
         self.assertEqual(self.reported, [])
 
 
+class StatusPhraseTests(unittest.TestCase):
+    """The two sentences an operator reads during a delegation."""
+
+    def test_names_the_worker_while_waiting_for_it(self):
+        self.assertEqual(
+            acpx_process.waiting_phrase("claude"), "Delegating task to claude worker…"
+        )
+        self.assertEqual(
+            acpx_process.waiting_phrase("pi"), "Delegating task to pi worker…"
+        )
+
+    def test_reports_the_worker_and_its_action(self):
+        self.assertEqual(
+            acpx_process.activity_phrase("claude", "Read FareParser.java"),
+            "claude worker: Read FareParser.java",
+        )
+        self.assertEqual(
+            acpx_process.activity_phrase("pi", "Run bun test"), "pi worker: Run bun test"
+        )
+
+    def test_a_new_worker_needs_no_change_here(self):
+        """The worker name is interpolated, never branched on."""
+        self.assertEqual(
+            acpx_process.activity_phrase("codex", "Edit Fare.java"),
+            "codex worker: Edit Fare.java",
+        )
+        self.assertEqual(
+            acpx_process.waiting_phrase("gemini"), "Delegating task to gemini worker…"
+        )
+
+    def test_stays_within_the_platform_status_limit(self):
+        """Slack truncates its status line around 50 characters."""
+        for worker in ("claude", "pi"):
+            self.assertLessEqual(len(acpx_process.waiting_phrase(worker)), 50)
+
+
+class CombinedReporterTests(unittest.TestCase):
+    def test_is_none_when_neither_surface_exists(self):
+        self.assertIsNone(acpx_process._combined_reporter("claude", None))
+
+    def test_publishes_the_worker_prefixed_phrase(self):
+        published = []
+
+        report = acpx_process._combined_reporter("claude", published.append)
+        report("Run bun test")
+
+        self.assertEqual(published, ["claude worker: Run bun test"])
+
+    def test_a_failing_status_publisher_does_not_stop_the_run(self):
+        def explode(_):
+            raise RuntimeError("status surface is down")
+
+        acpx_process._combined_reporter("claude", explode)("Run bun test")
+
+
 class ActivityReporterTests(ProcessTestCase):
     def test_is_none_when_the_host_offers_no_callback(self):
         """The tests run without Hermes, so this is also the offline path."""

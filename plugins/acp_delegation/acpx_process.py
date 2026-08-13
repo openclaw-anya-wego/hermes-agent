@@ -91,8 +91,15 @@ def run(
         # Captured here, on the handler's thread. The host's activity callback
         # is thread-local, so a reader thread cannot look it up for itself —
         # get_activity_callback exists for exactly this handoff.
-        report_activity = _capture_activity_reporter(worker)
-        readers = _start_readers(process, stdout_lines, stderr_tail, report_activity)
+        publish_status = _capture_status_publisher()
+        if publish_status is not None:
+            publish_status(waiting_phrase(worker))
+        readers = _start_readers(
+            process,
+            stdout_lines,
+            stderr_tail,
+            _combined_reporter(worker, publish_status),
+        )
         writer = _start_writer(process, task)
         transcript, exit_code = _collect(
             process, stdout_lines, timeout_seconds + grace_seconds
@@ -216,6 +223,71 @@ def _stderr_text(tail: deque) -> str:
     must-not-raise contract.
     """
     return "".join(list(tail)).strip()
+
+
+def waiting_phrase(worker: str) -> str:
+    """What the operator sees before the worker has done anything.
+
+    Spawn and session setup take 5-15 seconds, and the worker's first action
+    can be a minute out on a large checkout. Without this the status line still
+    reads as the generic tool name for that whole stretch.
+    """
+    return "Delegating task to {} worker…".format(worker)
+
+
+def activity_phrase(worker: str, activity: str) -> str:
+    """What the worker is doing, in the operator's status line.
+
+    The worker name is interpolated, never branched on, so a new worker needs no
+    change here — it only has to speak ACP, which is the one thing every worker
+    this plugin can reach already does.
+
+    Kept short on purpose: the platform truncates around 50 characters, and
+    ``<worker> worker: `` already spends up to 15 of them.
+    """
+    return "{} worker: {}".format(worker, activity)
+
+
+def _capture_status_publisher():
+    """A callable that sets the operator-visible status phrase, or None.
+
+    Takes a finished phrase, so the caller owns the wording — the waiting text
+    and the per-action text are different sentences, not one template.
+
+    Captured on the handler's thread: the host's callback is thread-local and a
+    reader thread cannot look it up for itself.
+    """
+    try:
+        from tools.environments.base import get_status_callback
+
+        callback = get_status_callback()
+    except Exception:
+        return None
+    return callback
+
+
+def _combined_reporter(worker: str, publish_status):
+    """One reporter driving both surfaces, or None when neither exists.
+
+    They want the same events at the same rate but say different things: the
+    status line is a sentence for a human, the activity clock is a heartbeat
+    that keeps the stall watchdog quiet. Throttling them together keeps the two
+    from disagreeing about what the worker is doing.
+    """
+    report_activity = _capture_activity_reporter(worker)
+    if report_activity is None and publish_status is None:
+        return None
+
+    def report(activity: str) -> None:
+        if publish_status is not None:
+            try:
+                publish_status(activity_phrase(worker, activity))
+            except Exception:
+                pass
+        if report_activity is not None:
+            report_activity(activity)
+
+    return report
 
 
 def _capture_activity_reporter(worker: str):

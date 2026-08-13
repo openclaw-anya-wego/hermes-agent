@@ -662,6 +662,27 @@ def _run_agent_tool_execution_middleware(
     )
 
 
+def _status_setter(agent, function_name: str):
+    """ANYA-PATCH. A callable a tool uses to publish its own status phrase.
+
+    Emits ``tool.status``, which the gateway renders verbatim rather than
+    rebuilding from the tool name. Returns None when the host has no progress
+    callback, so the tool can skip the work entirely.
+    """
+    callback = getattr(agent, "tool_progress_callback", None)
+    if callback is None:
+        return None
+
+    def publish(phrase: str) -> None:
+        try:
+            callback("tool.status", function_name, phrase, None)
+        except Exception:
+            # A status update must never fail the tool it describes.
+            pass
+
+    return publish
+
+
 def _begin_tool_execution(
     agent,
     *,
@@ -702,6 +723,16 @@ def _begin_tool_execution(
         from tools.environments.base import set_activity_callback
 
         set_activity_callback(agent._touch_activity)
+    except Exception:
+        pass
+
+    # ANYA-PATCH: let a long-running tool replace the live status text while it
+    # works. Registered per tool call and pointed at this tool's name, so a
+    # phrase can never outlive the call that produced it.
+    try:
+        from tools.environments.base import set_status_callback
+
+        set_status_callback(_status_setter(agent, function_name))
     except Exception:
         pass
 

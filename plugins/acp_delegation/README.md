@@ -228,9 +228,23 @@ progress the host sees one tool call and no activity, and cannot tell a working
 worker from a hung one.
 
 So the stdout reader watches the worker's `tool_call` and `tool_call_update`
-events and reports the newest one to the host's activity callback as
-`claude worker: Run bun test`. The adapter's own `title` is used verbatim: it is
-already written for a human, and it is the same string an editor would display.
+events and reports the newest one. The adapter's own `title` is used verbatim: it
+is already written for a human, and it is the same string an editor would
+display.
+
+Two surfaces, fed together:
+
+| Surface | Shows |
+| --- | --- |
+| Live status line | `Delegating task to claude worker…`, then `claude worker: Run bun test…` |
+| Host activity clock | the same events, keeping the stall watchdog quiet |
+
+The status line needs the core patch described in `ANYA-PATCHES.md`; without it
+the plugin still reports to the activity clock and the line stays generic.
+
+**Adding a worker changes nothing here.** The phrase interpolates the `worker`
+argument rather than branching on it, and the events come from ACP, which every
+reachable worker speaks: `codex worker: Edit Fare.java…` needs no code.
 
 - **At most one report per 5 s**, and never the same action twice. A worker doing
   ten things a second would otherwise turn the status line into a flicker.
