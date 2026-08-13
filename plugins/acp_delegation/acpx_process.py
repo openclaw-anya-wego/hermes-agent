@@ -1,8 +1,14 @@
 """Run one acpx delegation and collect its output.
 
-Owns the whole subprocess lifetime: spawn, stream, deadline, teardown. Hermes
-applies no timeout to a tool handler, so the deadline here is the only thing
-stopping a wedged worker from holding a Slack turn open indefinitely.
+Owns the whole subprocess lifetime: spawn, stream, deadline, teardown. The
+deadline here is the only thing stopping a wedged worker from holding a Slack
+turn open indefinitely — but only while ``acp_delegate`` stays OUT of
+``agent/tool_dispatch_helpers._PARALLEL_SAFE_TOOLS``. Tools in that set run on
+the concurrent path, which abandons the whole batch after
+``_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S`` (420 s) — shorter than this plugin's 900 s
+default and its 3600 s maximum. Adding this tool there without also clamping the
+timeout would report a live delegation as failed and leave the overlay installed
+on a thread nobody is waiting for.
 
 While a worker is running this writes a lease file that ``safe-restart.sh``
 reads, so a gateway restart can tell a delegation is in flight. The lease is
@@ -71,15 +77,21 @@ def run(
     stderr_tail: deque = deque(maxlen=STDERR_TAIL_LINES)
 
     try:
-        _send_task(process, task)
+        # Readers first, and the prompt written from its own thread. Writing it
+        # inline deadlocks on a task larger than the pipe buffer: this side
+        # blocks in write() while acpx blocks writing output nobody is draining.
+        # That happens before the deadline loop below is armed, so nothing would
+        # ever time it out.
         readers = _start_readers(process, stdout_lines, stderr_tail)
+        writer = _start_writer(process, task)
         transcript, exit_code = _collect(
             process, stdout_lines, timeout_seconds + grace_seconds
         )
-        _join(readers)
-        return RunOutcome(transcript, exit_code, "".join(stderr_tail).strip())
+        _join(readers + [writer])
+        return RunOutcome(transcript, exit_code, _stderr_text(stderr_tail))
     finally:
         _terminate(process)
+        _close_pipes(process)
         _remove_lease(lease_path)
 
 
@@ -131,6 +143,10 @@ def _spawn(command: List[str], working_directory: str) -> subprocess.Popen:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # A worker can relay a non-UTF-8 byte from a file it read. Strict
+            # decoding would kill the reader thread silently, and the run would
+            # then look like a hang rather than an encoding fault.
+            errors="replace",
             bufsize=1,
             env=os.environ.copy(),
         )
@@ -144,15 +160,33 @@ def _spawn(command: List[str], working_directory: str) -> subprocess.Popen:
         raise SpawnError("Could not start acpx: {}".format(error), "spawn_failed")
 
 
+def _start_writer(process: subprocess.Popen, task: str) -> threading.Thread:
+    """Send the prompt on its own thread, so a full pipe cannot block the caller."""
+    writer = threading.Thread(target=_send_task, args=(process, task), daemon=True)
+    writer.start()
+    return writer
+
+
 def _send_task(process: subprocess.Popen, task: str) -> None:
     """Hand the prompt over and close stdin so acpx stops waiting for more."""
     try:
         process.stdin.write(task)
         process.stdin.close()
-    except (BrokenPipeError, ValueError):
+    except (BrokenPipeError, ValueError, OSError):
         # acpx died before reading the prompt. The exit code explains why, so
-        # let the collection path report it rather than raising a second fault.
+        # let the collection path report it rather than raising a second fault
+        # from a daemon thread nobody is watching.
         pass
+
+
+def _stderr_text(tail: deque) -> str:
+    """Snapshot stderr without iterating a deque another thread may append to.
+
+    ``list()`` on a deque is atomic under the GIL; iterating one lazily while a
+    reader thread appends raises RuntimeError, which would escape the handler's
+    must-not-raise contract.
+    """
+    return "".join(list(tail)).strip()
 
 
 def _start_readers(
@@ -175,14 +209,27 @@ def _start_readers(
 
 
 def _read_stdout(process: subprocess.Popen, lines: "queue.Queue[Optional[str]]") -> None:
-    for line in process.stdout:
-        lines.put(line)
-    lines.put(None)
+    """Drain stdout, and always post the sentinel.
+
+    A reader that dies without posting it would leave the collector waiting for
+    output that can never arrive, which reads as a hung worker rather than a
+    broken pipe.
+    """
+    try:
+        for line in process.stdout:
+            lines.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        lines.put(None)
 
 
 def _read_stderr(process: subprocess.Popen, tail: deque) -> None:
-    for line in process.stderr:
-        tail.append(line)
+    try:
+        for line in process.stderr:
+            tail.append(line)
+    except (OSError, ValueError):
+        pass
 
 
 def _collect(
@@ -229,6 +276,21 @@ def _terminate(process: subprocess.Popen) -> None:
         try:
             process.kill()
         except Exception:
+            pass
+
+
+def _close_pipes(process: subprocess.Popen) -> None:
+    """Release the pipe file objects.
+
+    The gateway is long-lived, so leaking three descriptors per delegation would
+    eventually reach the plist's NumberOfFiles limit.
+    """
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except OSError:
             pass
 
 

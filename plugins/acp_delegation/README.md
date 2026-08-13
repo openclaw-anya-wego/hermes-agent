@@ -76,6 +76,28 @@ merges deny globs into `<cwd>/.claude/settings.local.json`, which the ACP sessio
 loads as project-scoped settings, and restores the file afterwards. The shared
 `~/.claude/settings.json` is never touched.
 
+### This is a denylist, not a sandbox
+
+Read this before trusting it. The path layer closes the directories that let a
+delegated task **escalate** — rewrite the agents, read a credential, or arrange
+to run again later:
+
+| Group | Paths |
+| --- | --- |
+| Agent config | `~/.openclaw`, `~/.hermes`, `~/clawd`, `~/.claude` |
+| Credentials | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/Library/Keychains` |
+| Startup | `~/Library/LaunchAgents`, `/etc`, `/Library`, shell rc files, `~/.gitconfig` |
+
+It does **not** confine writes to `cwd`. A task that names some other repository
+under the operator's home will be allowed to edit it. Doing better needs a
+permission decision that can see the path, which means the ACP Python SDK's
+`request_permission` callback rather than acpx. Until that lands, do not
+describe this tool as sandboxed.
+
+The rules are applied for `claude` only. Writing Claude Code's settings format
+for a `pi` delegation would drop a file into the checkout that `pi` ignores — a
+gesture that reads as a guard and is not one.
+
 ## Verifying a result
 
 The handler returns `success: false` with `error_type: "false_success"` when the

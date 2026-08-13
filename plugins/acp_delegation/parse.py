@@ -222,10 +222,13 @@ def _failure(
 
 
 def _truncate(text: str, max_chars: int) -> tuple:
-    """Bound a payload the framework will not bound for us.
+    """Last-resort bound on a runaway reply.
 
-    Hermes truncates an oversized ``error`` field at dispatch but leaves success
-    payloads alone, so a chatty worker would otherwise flood the model's context.
+    Not the primary mechanism. Hermes already spills an oversized tool result to
+    a file and hands the model a readable path (``maybe_persist_tool_result``),
+    which preserves the whole reply instead of discarding its tail — so the
+    plugin declares ``max_result_size_chars`` at registration and lets the host
+    do it. This only fires if a worker returns something larger still.
     """
     if max_chars <= 0 or len(text) <= max_chars:
         return text, False

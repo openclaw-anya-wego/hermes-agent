@@ -26,7 +26,10 @@ PLUGIN_ID = "acp_delegation"
 DEFAULT_TIMEOUT_SECONDS = 900
 MAX_TIMEOUT_SECONDS = 3600
 MIN_TIMEOUT_SECONDS = 30
-DEFAULT_MAX_RESPONSE_CHARS = 8000
+# Well above what a reply normally reaches. Hermes spills anything larger than
+# `max_result_size_chars` to a file and gives the model a path to read it, so a
+# low plugin-side cap would throw away what the host would have preserved.
+DEFAULT_MAX_RESPONSE_CHARS = 100000
 
 # Time allowed after acpx's own --timeout should have fired. acpx is expected to
 # stop the worker itself; this margin only covers acpx hanging, which is why it
