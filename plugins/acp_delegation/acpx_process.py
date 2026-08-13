@@ -54,16 +54,17 @@ KEEP_ALIVE_INTERVAL_SECONDS = 60
 # session setup produce output well before any tool call.
 UNNAMED_ACTIVITY = "working"
 
-# Nothing between set_status_text() and the connector truncates, so the phrase's
-# author is the only party that can hold a budget at all.
+# Readability, not a platform limit. The phrase lands on Slack's composer-footer
+# status line, which accepted 300 characters when measured against the live API
+# on 2026-08-13.
 #
-# Wider than the 49 `agent.display.build_status_phrase` uses. That number tracks
-# an observation that Slack truncates its status line "around 50 characters",
-# and a tool name plus a verb fits inside it. A delegation's phrase spends its
-# first 15 characters on "<worker> worker: " and then needs a path, so at 50 it
-# was arriving as "pi worker: read" — the budget, not Slack, was the constraint.
-# If Slack does clip this, it clips a phrase that already said which file.
-STATUS_PHRASE_MAX_CHARS = 80
+# Slack DOES enforce a hard 50 on its other status surface — `loading_messages`,
+# the inline one — and rejects the whole call at 51 rather than truncating. That
+# surface is deliberately not used: the upstream adapter never sends it, and
+# upstream documents the inline text as Slack's own. Reaching for it meant
+# patching a fourth core file, and every core file patched is a rebase conflict
+# forever.
+STATUS_PHRASE_MAX_CHARS = 160
 
 LEASE_DIRECTORY = os.path.join("runtime", "acp_delegation", "active")
 
