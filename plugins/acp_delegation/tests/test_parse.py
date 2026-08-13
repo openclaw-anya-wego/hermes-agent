@@ -179,6 +179,84 @@ class ActivityTests(unittest.TestCase):
         self.assertIsNone(transcript_from([line]).last_activity)
 
 
+def protocol_error(message="Authentication required", code=-32000, request_id=2):
+    """The real line acpx emitted when the claude worker refused a prompt.
+
+    Captured from a live run on 2026-08-13. A JSON-RPC reply carries "result"
+    OR "error"; this one has no "result" key at all, which is how it slipped
+    past the parser for the whole of stage 5.
+    """
+    body = {"jsonrpc": "2.0", "id": request_id}
+    if message is not None:
+        body["error"] = {"code": code, "message": message}
+    return json.dumps(body)
+
+
+class ProtocolErrorTests(unittest.TestCase):
+    """Why a run stopped, in the worker's own words.
+
+    acpx reports a refusal on the protocol stream, never on stderr, so before
+    this the only surviving evidence was "exit 1" — and an agent handed a
+    three-way disjunction and no evidence reports a guess as a cause.
+    """
+
+    def test_records_the_workers_stated_reason(self):
+        transcript = transcript_from([protocol_error()])
+
+        self.assertEqual(transcript.protocol_error.message, "Authentication required")
+        self.assertEqual(transcript.protocol_error.code, -32000)
+
+    def test_the_error_replaces_the_three_way_guess(self):
+        transcript = transcript_from([protocol_error()])
+
+        result = build_result(transcript, EXIT_AGENT_ERROR, MAX_CHARS)
+
+        self.assertIn("Authentication required", result["error"])
+        self.assertIn("-32000", result["error"])
+        self.assertNotIn("agent, protocol, or runtime", result["error"])
+
+    def test_carries_the_error_structurally_too(self):
+        """stderr_tail is empty for exactly these failures, so prose alone
+        leaves nothing for a caller to match on."""
+        transcript = transcript_from([protocol_error()])
+
+        result = build_result(transcript, EXIT_AGENT_ERROR, MAX_CHARS)
+
+        self.assertEqual(
+            result["protocol_error"], {"code": -32000, "message": "Authentication required"}
+        )
+
+    def test_falls_back_to_the_generic_message_when_nothing_was_said(self):
+        result = build_result(Transcript(), EXIT_AGENT_ERROR, MAX_CHARS)
+
+        self.assertIn("agent, protocol, or runtime", result["error"])
+        self.assertNotIn("protocol_error", result)
+
+    def test_keeps_the_last_error_not_the_first(self):
+        """An early decline can be a routine capability probe. The one that
+        matters is the one nothing recovered from."""
+        transcript = transcript_from(
+            [
+                protocol_error("Method not found", code=-32601, request_id=1),
+                protocol_error("Authentication required", code=-32000, request_id=2),
+            ]
+        )
+
+        self.assertEqual(transcript.protocol_error.message, "Authentication required")
+
+    def test_ignores_an_error_with_no_message(self):
+        transcript = transcript_from(['{"jsonrpc":"2.0","id":1,"error":{"code":-1}}'])
+
+        self.assertIsNone(transcript.protocol_error)
+
+    def test_a_successful_reply_is_still_a_result(self):
+        """The new branch must not swallow the reply that ends a turn."""
+        transcript = transcript_from([final_result()])
+
+        self.assertTrue(transcript.saw_final_result)
+        self.assertIsNone(transcript.protocol_error)
+
+
 class BareTitleTests(unittest.TestCase):
     """pi-acp sends the tool name as the title, so "read" arrives alone.
 
