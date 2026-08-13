@@ -21,6 +21,7 @@ from parse import (  # noqa: E402
     EXIT_PERMISSION_DENIED,
     EXIT_TIMEOUT,
     Transcript,
+    activity_from_line,
     build_result,
     consume_line,
 )
@@ -176,6 +177,57 @@ class ActivityTests(unittest.TestCase):
         )
 
         self.assertIsNone(transcript_from([line]).last_activity)
+
+
+class BareTitleTests(unittest.TestCase):
+    """pi-acp sends the tool name as the title, so "read" arrives alone.
+
+    On a status line that says nothing — read what? — and it is what the
+    operator actually saw: "pi worker: read".
+    """
+
+    def update(self, **fields):
+        payload = {"sessionUpdate": "tool_call", "status": "in_progress"}
+        payload.update(fields)
+        return json.dumps({"method": "session/update", "params": {"update": payload}})
+
+    def test_names_the_file_from_locations(self):
+        line = self.update(
+            title="read",
+            locations=[{"path": "/Users/x/repo/apps/system/lib/http.ts"}],
+        )
+
+        self.assertEqual(activity_from_line(line), "read lib/http.ts")
+
+    def test_falls_back_to_the_raw_command(self):
+        line = self.update(title="bash", rawInput={"command": "bun test --filter fare"})
+
+        self.assertEqual(
+            activity_from_line(line), "bash bun test --filter fare"
+        )
+
+    def test_does_not_repeat_a_subject_the_title_already_names(self):
+        """claude-agent-acp writes a sentence, so enriching it would say the
+        file twice: "Read FareParser.java src/FareParser.java"."""
+        line = self.update(
+            title="Read FareParser.java",
+            locations=[{"path": "/Users/x/repo/src/FareParser.java"}],
+        )
+
+        self.assertEqual(activity_from_line(line), "Read FareParser.java")
+
+    def test_keeps_a_bare_title_when_there_is_nothing_to_add(self):
+        self.assertEqual(activity_from_line(self.update(title="think")), "think")
+
+    def test_takes_only_the_first_line_of_a_multiline_command(self):
+        line = self.update(title="bash", rawInput={"command": "cd repo\nbun test"})
+
+        self.assertEqual(activity_from_line(line), "bash cd repo")
+
+    def test_survives_a_location_list_that_is_not_objects(self):
+        line = self.update(title="read", locations=["/not/a/dict"])
+
+        self.assertEqual(activity_from_line(line), "read")
 
 
 class AvailableCommandsTests(unittest.TestCase):

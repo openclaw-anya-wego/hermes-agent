@@ -482,7 +482,9 @@ platforms:
 | `platforms.slack.typing_status_text` | `"is thinking..."` | Text of the working-state status line shown while the agent processes a message. Requires the `assistant:write` scope — without it the status call fails silently and Slack renders its own generic placeholder, whatever this is set to. Set `typing_indicator: false` to disable the status line entirely. |
 
 :::note Where the status renders
-The custom status appears in the **footer beneath the reply composer** ("*BotName* is thinking…"), not inline in the message list. The inline "Generating response…" / "Finding answers…" lines Slack shows in the message area while an AI app works are **Slack's own rotating indicators** — `assistant.threads.setStatus` does not control those, and both can appear at the same time.
+The custom status appears in the **footer beneath the reply composer** ("*BotName* is thinking…"). Slack shows a *second* indicator **inline in the message list** while an AI app works — "Generating response…", "Searching…" — and both are visible at once.
+
+That inline one is fed by the same API call's `loading_messages` argument, not by `status`. Hermes sends the live phrase to both, so the two agree. An app that sets only `status` gets Slack's own rotating placeholders inline, which is where the older claim that they were uncontrollable came from.
 :::
 
 The same key customizes Google Chat's visible working-state marker message
