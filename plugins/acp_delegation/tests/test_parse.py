@@ -29,6 +29,12 @@ from parse import (  # noqa: E402
 MAX_CHARS = 8000
 
 
+def activity_text(line):
+    """The phrase alone, for tests that do not care which call it came from."""
+    activity = activity_from_line(line)
+    return activity.text if activity is not None else None
+
+
 def chunk(text):
     return json.dumps(
         {
@@ -275,13 +281,13 @@ class BareTitleTests(unittest.TestCase):
             locations=[{"path": "/Users/x/repo/apps/system/lib/http.ts"}],
         )
 
-        self.assertEqual(activity_from_line(line), "read lib/http.ts")
+        self.assertEqual(activity_text(line), "read lib/http.ts")
 
     def test_falls_back_to_the_raw_command(self):
         line = self.update(title="bash", rawInput={"command": "bun test --filter fare"})
 
         self.assertEqual(
-            activity_from_line(line), "bash bun test --filter fare"
+            activity_text(line), "bash bun test --filter fare"
         )
 
     def test_does_not_repeat_a_subject_the_title_already_names(self):
@@ -292,20 +298,91 @@ class BareTitleTests(unittest.TestCase):
             locations=[{"path": "/Users/x/repo/src/FareParser.java"}],
         )
 
-        self.assertEqual(activity_from_line(line), "Read FareParser.java")
+        self.assertEqual(activity_text(line), "Read FareParser.java")
 
     def test_keeps_a_bare_title_when_there_is_nothing_to_add(self):
-        self.assertEqual(activity_from_line(self.update(title="think")), "think")
+        self.assertEqual(activity_text(self.update(title="think")), "think")
 
     def test_takes_only_the_first_line_of_a_multiline_command(self):
         line = self.update(title="bash", rawInput={"command": "cd repo\nbun test"})
 
-        self.assertEqual(activity_from_line(line), "bash cd repo")
+        self.assertEqual(activity_text(line), "bash cd repo")
 
     def test_survives_a_location_list_that_is_not_objects(self):
         line = self.update(title="read", locations=["/not/a/dict"])
 
-        self.assertEqual(activity_from_line(line), "read")
+        self.assertEqual(activity_text(line), "read")
+
+
+class DescribedActionTests(unittest.TestCase):
+    """The worker's own sentence beats its argv.
+
+    Measured over one real 31-call review: 28 calls carried a `description`,
+    and on every one it read better than the command. The three without were
+    `Read` calls, whose title already names the file — so the fallback chain
+    below still carries them.
+    """
+
+    def update(self, **fields):
+        payload = {"sessionUpdate": "tool_call_update", "toolCallId": "toolu_01"}
+        payload.update(fields)
+        return json.dumps({"method": "session/update", "params": {"update": payload}})
+
+    def test_prefers_the_description_over_the_raw_command(self):
+        line = self.update(
+            title="git status --short",
+            rawInput={
+                "command": "git status --short",
+                "description": "Show working tree status",
+            },
+        )
+
+        self.assertEqual(activity_text(line), "Show working tree status")
+
+    def test_a_subagent_spawn_reports_its_angle_not_its_brief(self):
+        """The reason description must WIN rather than be appended.
+
+        `saber-code-review` fans out seven reviewers, and each spawn carries a
+        multi-kilobyte prompt in rawInput. Appending it would bury the status
+        line in a reviewer brief.
+        """
+        line = self.update(
+            title="Task",
+            rawInput={
+                "prompt": "You are reviewing wego/wego-ai PR #1504 " * 200,
+                "description": "Angle A: line-by-line diff scan",
+            },
+        )
+
+        self.assertEqual(activity_text(line), "Angle A: line-by-line diff scan")
+
+    def test_falls_back_to_the_command_when_no_description_was_sent(self):
+        line = self.update(title="bash", rawInput={"command": "bun test --filter fare"})
+
+        self.assertEqual(activity_text(line), "bash bun test --filter fare")
+
+    def test_takes_one_line_of_a_multiline_description(self):
+        line = self.update(
+            title="gh api graphql",
+            rawInput={
+                "command": "gh api graphql -f query='\nquery {\n  repository\n}'",
+                "description": "Get unresolved threads\nand count them",
+            },
+        )
+
+        self.assertEqual(activity_text(line), "Get unresolved threads")
+
+    def test_ignores_a_blank_description(self):
+        line = self.update(
+            title="bash", rawInput={"command": "ls", "description": "   "}
+        )
+
+        self.assertEqual(activity_text(line), "bash ls")
+
+    def test_carries_the_call_id_so_a_refinement_is_recognisable(self):
+        line = self.update(title="Terminal", rawInput={})
+
+        self.assertEqual(activity_from_line(line).call_id, "toolu_01")
 
 
 class AvailableCommandsTests(unittest.TestCase):

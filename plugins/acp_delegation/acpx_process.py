@@ -577,30 +577,52 @@ class _ProgressRelay:
         self._status_due = _Throttle(ACTIVITY_INTERVAL_SECONDS)
         self._keep_alive_due = _Throttle(KEEP_ALIVE_INTERVAL_SECONDS)
         self._last_reported = None
+        self._last_reported_call_id = None
         self._latest_activity = None
 
     def consider(self, line: str) -> None:
         now = time.monotonic()
         activity = parse.activity_from_line(line)
-        if activity:
+        if activity is not None:
             self._latest_activity = activity
-            self._show_status(activity, now)
+        # Attempted on EVERY line, not only on the ones carrying an action. A
+        # throttled activity is held, not dropped, so something has to come back
+        # for it — and the next line of any kind is the cheapest trigger.
+        self._show_status(now)
         # Any line at all is evidence the worker is alive, including one this
         # plugin has no opinion about.
         self._keep_clock_warm(now)
 
-    def _show_status(self, activity: str, now: float) -> None:
-        if self._report_status is None or activity == self._last_reported:
+    def _show_status(self, now: float) -> None:
+        activity = self._latest_activity
+        if self._report_status is None or activity is None:
             return
-        if not self._status_due.due(now):
+        if activity.text == self._last_reported:
             return
-        self._last_reported = activity
-        self._report_status(activity)
+
+        # A REFINEMENT of the action already on the line bypasses the throttle.
+        # claude opens every tool call with an empty rawInput and a placeholder
+        # title, then names it properly a moment later — same toolCallId, ~200 ms
+        # apart. Throttling that leaves "Terminal" in front of the operator until
+        # the NEXT tool call, discarding "Show working tree status" entirely,
+        # which is what made every long delegation read as a wall of "Terminal".
+        # It is not flicker: it is one action being described correctly, and the
+        # text dedupe above already absorbs the repeats.
+        refines = (
+            activity.call_id is not None
+            and activity.call_id == self._last_reported_call_id
+        )
+        if not refines and not self._status_due.due(now):
+            return
+        self._last_reported = activity.text
+        self._last_reported_call_id = activity.call_id
+        self._report_status(activity.text)
 
     def _keep_clock_warm(self, now: float) -> None:
         if self._keep_alive is None or not self._keep_alive_due.due(now):
             return
-        self._keep_alive(self._latest_activity or UNNAMED_ACTIVITY)
+        latest = self._latest_activity
+        self._keep_alive(latest.text if latest else UNNAMED_ACTIVITY)
 
 
 def _read_stderr(process: subprocess.Popen, tail: deque) -> None:
