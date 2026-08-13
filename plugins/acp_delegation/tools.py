@@ -85,8 +85,10 @@ ACP_DELEGATE_SCHEMA = {
             "cwd": {
                 "type": "string",
                 "description": (
-                    "Absolute path to the checkout the worker should work in. Must be inside a "
-                    "directory the operator has approved."
+                    "Absolute path inside the project the worker should work in. Any path within "
+                    "the checkout will do — it is resolved up to the project root, so the worker "
+                    "picks up that project's own configuration. Must be inside a directory the "
+                    "operator has approved. The returned 'cwd' says where it actually ran."
                 ),
             },
             "timeout_seconds": {
@@ -112,8 +114,13 @@ def handle_acp_delegate(args: Dict[str, Any], **kwargs) -> str:
 
     overlay = None
     started_at = time.monotonic()
+    # One id for the run, shared by the lease and the settings overlay, so the
+    # two artefacts a delegation leaves on disk can be traced to each other.
+    run_id = uuid.uuid4().hex
     try:
-        overlay = settings_overlay.install(request["cwd"], _deny_rules_for(request["worker"]))
+        overlay = settings_overlay.install(
+            request["cwd"], _deny_rules_for(request["worker"]), run_id
+        )
         outcome = acpx_process.run(
             acpx_bin=settings.acpx_bin,
             worker=request["worker"],
@@ -122,7 +129,7 @@ def handle_acp_delegate(args: Dict[str, Any], **kwargs) -> str:
             timeout_seconds=request["timeout_seconds"],
             kind_policy=settings.kind_policy,
             grace_seconds=config.DEADLINE_GRACE_SECONDS,
-            lease_id=uuid.uuid4().hex,
+            lease_id=run_id,
         )
     except acpx_process.SpawnError as error:
         return tool_error(str(error), error_type=error.error_type, success=False)
@@ -173,7 +180,9 @@ def _validate(args: Dict[str, Any], settings: config.Settings) -> Dict[str, Any]
     return {
         "worker": worker,
         "task": task,
-        "cwd": config.resolve_working_directory(args.get("cwd") or "", settings.allowed_cwd_roots),
+        "cwd": config.resolve_working_directory(
+            args.get("cwd") or "", settings.allowed_cwd_roots, settings.project_markers
+        ),
         "timeout_seconds": settings.clamp_timeout(args.get("timeout_seconds")),
     }
 

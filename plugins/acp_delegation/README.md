@@ -41,13 +41,44 @@ plugins:
       acpx_bin: acpx                # absolute path if acpx is off PATH
       default_timeout_seconds: 900
       max_timeout_seconds: 3600
-      max_response_chars: 8000
+      max_response_chars: 100000
+      project_markers:              # what makes a directory a project root
+        - .git                      # default: .git, .hg, .svn
       kind_policy:                  # acpx --permission-policy
         autoApprove: [read, search, edit]
         autoDeny: []
         escalate: []
         defaultAction: deny
 ```
+
+## One root, many projects
+
+`allowed_cwd_roots` answers *may the worker touch this at all*. It does not say
+which project a task runs in — a root normally holds dozens, and each delegation
+targets a different one. So the project root is resolved **per request**, by
+walking up from the path given until a `project_markers` entry is found.
+
+| Request | Runs in |
+| --- | --- |
+| `…/working-repos/falcon` | `…/working-repos/falcon` |
+| `…/working-repos/falcon/src/app` | `…/working-repos/falcon` |
+| `…/working-repos` | refused — `invalid_cwd` |
+
+That last row is the point. The worker's cwd decides whose settings, agents,
+hooks and MCP servers it loads, so a task run at the directory that merely
+*contains* the checkouts gets none of the project's configuration — and nothing
+about the result says so. Refusing is the only outcome that is not silent. The
+returned `cwd` always reports where the worker actually ran.
+
+The walk never goes above the allowed root that admitted the path, so anchoring
+cannot escape the boundary.
+
+Markers are **version-control roots, not agent config**. Anchoring on `.claude/`
+would resolve one path differently per worker: a monorepo package carrying Claude
+settings but no pi settings would be the project root for `claude` and not for
+`pi`, and every new tool would need another entry. A repository root means the
+same thing to all of them. Projects that are not checkouts are what
+`project_markers` is for.
 
 ## The tool
 
@@ -72,9 +103,35 @@ worker asked to write outside its working directory produces an ordinary `edit`
 request that looks identical to a legitimate one.
 
 So the path rules go where paths are understood. Before each run the plugin
-merges deny globs into `<cwd>/.claude/settings.local.json`, which the ACP session
-loads as project-scoped settings, and restores the file afterwards. The shared
-`~/.claude/settings.json` is never touched.
+merges deny globs into `<project root>/.claude/settings.local.json`, which the
+ACP session loads as project-scoped settings, and withdraws them afterwards. The
+shared `~/.claude/settings.json` is never touched.
+
+That the session reads them is not an assumption: the adapter passes
+`settingSources: ["user", "project", "local"]` and `cwd: params.cwd`
+(`claude-agent-acp/src/acp-agent.ts:4830` and `:4852`). Its own docs do not
+mention settings, which is why this is cited from source.
+
+### The file belongs to the operator
+
+It sits in a checkout they also work in, so every rule this plugin adds is
+labelled with who added it, under a `_acp_delegation` key. Restore works by that
+marker rather than by restoring a snapshot, because a snapshot only survives
+while there is exactly one writer and nothing interrupts it:
+
+- **Killed mid-run** — a gateway bounce, a reboot — a snapshot dies with the
+  process, leaving the deny rules in the operator's repository forever and
+  silently applying to their own interactive sessions. The next install in that
+  directory prunes whatever a dead run left, so this self-heals. `grep -r
+  _acp_delegation` finds any that are still sitting there.
+- **Two delegations in one checkout** — each run records the rules it *requires*,
+  and a rule is withdrawn only once no remaining run requires it. Finishing first
+  cannot disarm a run that is still going, in either order.
+
+Rules the repository denies on its own are honoured but never claimed, so no
+restore can take away something the operator wrote. Restore preserves the file's
+*content*, not its bytes: it is regenerated from what is on disk at the time, so
+an edit made while the worker ran survives and the indentation becomes ours.
 
 ### This is a denylist, not a sandbox
 

@@ -32,8 +32,12 @@ def outcome(text="done", exit_code=0, output_tokens=5):
 
 class HandlerTestCase(unittest.TestCase):
     def setUp(self):
+        # The allowed root holds projects; it is not one itself. The worker runs
+        # in a project under it, resolved per request.
         self.root = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.project = os.path.join(self.root, "repo")
+        os.makedirs(os.path.join(self.project, ".git"))
 
         self.original_config = tools._load_hermes_config
         self.original_run = acpx_process.run
@@ -58,7 +62,7 @@ class HandlerTestCase(unittest.TestCase):
         acpx_process.run = _run
 
     def delegate(self, **overrides):
-        args = {"worker": "claude", "task": "do the thing", "cwd": self.root}
+        args = {"worker": "claude", "task": "do the thing", "cwd": self.project}
         args.update(overrides)
         return json.loads(tools.handle_acp_delegate(args))
 
@@ -69,6 +73,20 @@ class ValidationTests(HandlerTestCase):
 
     def test_rejects_an_empty_task(self):
         self.assertEqual(self.delegate(task="   ")["error_type"], "invalid_task")
+
+    def test_rejects_a_directory_that_merely_contains_projects(self):
+        """Pins the wiring: the marker setting has to reach the resolver."""
+        self.assertEqual(self.delegate(cwd=self.root)["error_type"], "invalid_cwd")
+
+    def test_runs_a_subdirectory_request_in_its_project(self):
+        deep = os.path.join(self.project, "src")
+        os.makedirs(deep)
+        self.stub_run(outcome("done"))
+
+        result = self.delegate(cwd=deep)
+
+        self.assertEqual(result["cwd"], self.project)
+        self.assertEqual(self.calls[0]["working_directory"], self.project)
 
     def test_rejects_a_directory_outside_the_allowed_roots(self):
         self.assertEqual(self.delegate(cwd="/etc")["error_type"], "invalid_cwd")
@@ -95,7 +113,7 @@ class SuccessTests(HandlerTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["response"], "all done")
         self.assertEqual(result["worker"], "claude")
-        self.assertEqual(result["cwd"], self.root)
+        self.assertEqual(result["cwd"], self.project)
         self.assertIn("duration_seconds", result)
 
     def test_passes_the_validated_request_through_to_acpx(self):
@@ -106,7 +124,7 @@ class SuccessTests(HandlerTestCase):
         call = self.calls[0]
         self.assertEqual(call["worker"], "pi")
         self.assertEqual(call["task"], "fix it")
-        self.assertEqual(call["working_directory"], self.root)
+        self.assertEqual(call["working_directory"], self.project)
 
     def test_clamps_an_absurd_timeout_before_spawning(self):
         self.stub_run(outcome())
@@ -148,7 +166,7 @@ class FailureTests(HandlerTestCase):
     def test_always_returns_a_json_string(self):
         self.stub_run(outcome(exit_code=1))
 
-        raw = tools.handle_acp_delegate({"worker": "claude", "task": "x", "cwd": self.root})
+        raw = tools.handle_acp_delegate({"worker": "claude", "task": "x", "cwd": self.project})
 
         self.assertIsInstance(raw, str)
         self.assertIsInstance(json.loads(raw), dict)
@@ -156,7 +174,7 @@ class FailureTests(HandlerTestCase):
 
 class OverlayLifecycleTests(HandlerTestCase):
     def settings_file(self):
-        return os.path.join(self.root, ".claude", "settings.local.json")
+        return os.path.join(self.project, ".claude", "settings.local.json")
 
     def test_installs_deny_rules_while_the_worker_runs(self):
         seen = {}
