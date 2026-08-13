@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,10 +76,19 @@ class ProcessTestCase(unittest.TestCase):
         with open(script, "w", encoding="utf-8") as handle:
             handle.write(source)
 
+        # Control calls must be answered separately from the prompt. The plugin
+        # opens a named session and sets its mode before prompting, and a stub
+        # that ran the worker for those too would make a slow worker cost three
+        # timeouts and a failing worker fail during setup instead of during the
+        # run — neither of which is what the test is about.
         wrapper = os.path.join(self.workdir, "fake-acpx")
         with open(wrapper, "w", encoding="utf-8") as handle:
             handle.write(
-                '#!/bin/sh\nexec "{}" "{}" {} {}\n'.format(
+                '#!/bin/sh\n'
+                'for arg in "$@"; do\n'
+                '  case "$arg" in sessions|set-mode) exit 0 ;; esac\n'
+                'done\n'
+                'exec "{}" "{}" {} {}\n'.format(
                     sys.executable, script, chatter, exit_code
                 )
             )
@@ -199,6 +209,32 @@ class LeaseTests(ProcessTestCase):
         outcome = self.run_task(self.fake_worker())
 
         self.assertEqual(outcome.exit_code, 0)
+
+    def test_leaves_no_staging_file_for_the_reader_to_trip_over(self):
+        acpx_process._write_lease("abc123", 4242, "claude", "/tmp/repo")
+
+        self.assertEqual(os.listdir(acpx_process.lease_directory()), ["abc123.json"])
+
+    def test_a_write_that_dies_mid_flush_publishes_no_lease(self):
+        """The reason the write is a rename rather than an in-place truncate.
+
+        safe-restart.sh aborts on a lease it cannot parse, and nothing reaps one
+        whose owner is gone — so a zero-byte file here blocks every future
+        restart of the gateway, permanently and by hand-repair only.
+        """
+        directory = acpx_process.lease_directory()
+        os.makedirs(directory, exist_ok=True)
+
+        def die_mid_write(*_args, **_kwargs):
+            raise OSError("killed between truncate and flush")
+
+        with mock.patch.object(acpx_process.json, "dump", die_mid_write):
+            path = acpx_process._write_lease("abc123", 4242, "claude", "/tmp/repo")
+
+        self.assertIsNone(path)
+        self.assertEqual(
+            [name for name in os.listdir(directory) if name.endswith(".json")], []
+        )
 
 
 class StatusRelayTests(unittest.TestCase):
@@ -453,6 +489,89 @@ def _tool_call_line(title, status="in_progress"):
     )
 
 
+class SessionModeTests(ProcessTestCase):
+    """The worker runs in a named session so its mode can be set.
+
+    The mode is the whole reason for the session. acpx sets none, so a worker
+    left at the adapter's default asks permission for every action and acpx
+    answers from the kind policy — which denies `execute` and left a review
+    worker unable to run `git status`.
+    """
+
+    def recording_acpx(self, mode_exit=0):
+        """An acpx stand-in that logs its control calls to a file."""
+        log = os.path.join(self.workdir, "control.log")
+        worker = os.path.join(self.workdir, "worker.py")
+        with open(worker, "w", encoding="utf-8") as handle:
+            handle.write(FAKE_WORKER)
+
+        wrapper = os.path.join(self.workdir, "recording-acpx")
+        with open(wrapper, "w", encoding="utf-8") as handle:
+            handle.write(
+                '#!/bin/sh\n'
+                'for arg in "$@"; do\n'
+                '  case "$arg" in\n'
+                '    sessions) echo "$@" >> "%s"; exit 0 ;;\n'
+                '    set-mode) echo "$@" >> "%s"; exit %d ;;\n'
+                '  esac\n'
+                'done\n'
+                'exec "%s" "%s" 0 0\n'
+                % (log, log, mode_exit, sys.executable, worker)
+            )
+        os.chmod(wrapper, 0o755)
+        return wrapper, log
+
+    def control_calls(self, log):
+        if not os.path.exists(log):
+            return []
+        with open(log, encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+
+    def test_creates_a_named_session_and_sets_the_mode(self):
+        binary, log = self.recording_acpx()
+
+        self.run_task(binary)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions new --name acp-" in c for c in calls), calls)
+        self.assertTrue(any("set-mode auto" in c for c in calls), calls)
+
+    def test_closes_the_session_afterwards(self):
+        binary, log = self.recording_acpx()
+
+        self.run_task(binary)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions close acp-" in c for c in calls), calls)
+
+    def test_a_failed_mode_change_fails_the_run(self):
+        """Continuing in the wrong mode reproduces the original fault: a worker
+        that cannot act, reporting something else as the reason."""
+        binary, _ = self.recording_acpx(mode_exit=1)
+
+        with self.assertRaises(acpx_process.SpawnError) as caught:
+            self.run_task(binary)
+
+        self.assertIn("mode", str(caught.exception))
+
+    def test_the_session_name_carries_the_run_id(self):
+        """The lease, the settings overlay and the session share one id, so the
+        artefacts a delegation leaves behind can be traced to each other."""
+        request = acpx_process.RunRequest(
+            acpx_bin="acpx",
+            worker="claude",
+            task="t",
+            working_directory=self.workdir,
+            timeout_seconds=30,
+            kind_policy=KIND_POLICY,
+            grace_seconds=5,
+            lease_id="deadbeef",
+        )
+
+        self.assertEqual(acpx_process._session_name(request), "acp-deadbeef")
+        self.assertEqual(request.permission_mode, "auto")
+
+
 class CommandTests(ProcessTestCase):
     def test_passes_the_policy_and_cwd_to_acpx(self):
         command = acpx_process._build_command(
@@ -505,7 +624,10 @@ class CommandTests(ProcessTestCase):
             )
         )
 
-        self.assertEqual(command[-3:], ["exec", "-f", "-"])
+        self.assertEqual(command[-3:], ["prompt", "-f", "-"])
+        # A NAMED session, not a one-shot exec: the mode can only be set on a
+        # session, and the mode is what lets the worker run anything.
+        self.assertIn("-s", command)
         self.assertNotIn("a very long prompt", command)
 
 

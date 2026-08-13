@@ -101,6 +101,7 @@ class RunRequest:
     kind_policy: Dict[str, Any]
     grace_seconds: int
     lease_id: str
+    permission_mode: str = "auto"
 
 
 class HostProgress(NamedTuple):
@@ -124,6 +125,10 @@ def run(request: RunRequest, host_progress: Optional[HostProgress] = None) -> Ru
     ``host_progress`` is absent in the tests and on any host that registered no
     callbacks. Reporting is a courtesy; the delegation runs identically without.
     """
+    # A named session, not a one-shot `exec`. The mode can only be set on a
+    # session, and the mode is what decides whether the worker may run anything
+    # at all — see _open_session.
+    _open_session(request)
     command = _build_command(request)
     process = _spawn(command, request.working_directory)
 
@@ -162,6 +167,7 @@ def run(request: RunRequest, host_progress: Optional[HostProgress] = None) -> Ru
         _terminate(process)
         _close_pipes(process)
         _remove_lease(lease_path)
+        _close_session(request)
 
 
 def lease_directory() -> str:
@@ -174,8 +180,20 @@ def lease_directory() -> str:
     return os.path.join(home, LEASE_DIRECTORY)
 
 
+CONTROL_TIMEOUT_SECONDS = 60
+
+
+def _session_name(request: RunRequest) -> str:
+    """One acpx session per run, named after it.
+
+    Shares the run id with the lease and the settings overlay, so the three
+    artefacts a delegation leaves behind can be traced to each other.
+    """
+    return "acp-{}".format(request.lease_id)
+
+
 def _build_command(request: RunRequest) -> List[str]:
-    """Assemble the acpx invocation.
+    """Assemble the prompt invocation.
 
     The task itself is not here. It goes over stdin via ``-f -`` so that no
     prompt can be mangled by argv quoting or hit an argument-length limit.
@@ -191,10 +209,105 @@ def _build_command(request: RunRequest) -> List[str]:
         "--permission-policy",
         json.dumps(request.kind_policy),
         request.worker,
-        "exec",
+        "-s",
+        _session_name(request),
+        "prompt",
         "-f",
         "-",
     ]
+
+
+def _control(request: RunRequest, arguments: List[str], failure: str) -> None:
+    """Run a short acpx control command, raising SpawnError if it fails."""
+    command = [request.acpx_bin, "--cwd", request.working_directory] + arguments
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=request.working_directory,
+            capture_output=True,
+            text=True,
+            timeout=CONTROL_TIMEOUT_SECONDS,
+            env=_build_environment(),
+        )
+    except FileNotFoundError:
+        raise SpawnError(
+            "acpx was not found at '{}'. Install it with `npm install -g acpx`, or set "
+            "plugins.entries.acp_delegation.acpx_bin to its absolute path.".format(
+                request.acpx_bin
+            ),
+            "acpx_not_found",
+        )
+    except subprocess.TimeoutExpired:
+        raise SpawnError("{}: timed out.".format(failure), "spawn_failed")
+    except OSError as error:
+        raise SpawnError("{}: {}".format(failure, error), "spawn_failed")
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise SpawnError(
+            "{} (exit {}). {}".format(failure, completed.returncode, detail[:500]),
+            "spawn_failed",
+        )
+
+
+def _open_session(request: RunRequest) -> None:
+    """Create the session and set the mode the worker runs under.
+
+    Both are needed before the prompt, and the mode is the point. acpx sets none
+    — its bundle contains no mode ids at all — so the worker starts in the
+    adapter's ``default`` mode, asks about every action, and acpx answers from
+    ``--permission-policy``. That policy matches tool KINDS and never paths, so
+    it cannot allow "run git" without also allowing "run anything"; denying
+    ``execute`` is what left a review worker unable to run ``git status``.
+
+    ``auto`` moves the judgement back into the worker, which decides per action
+    and mostly never asks — leaving the kind policy as the backstop for what it
+    does escalate, rather than the first and only word.
+
+    A failure here raises rather than warns. Continuing in the wrong mode
+    reproduces the original fault exactly: a worker that cannot act, reporting
+    something else as the reason.
+    """
+    session = _session_name(request)
+    _control(
+        request,
+        [request.worker, "sessions", "new", "--name", session],
+        "acpx could not create a session for the worker",
+    )
+    if not request.permission_mode:
+        return
+    _control(
+        request,
+        [request.worker, "-s", session, "set-mode", request.permission_mode],
+        "acpx could not set the worker's mode to '{}'".format(request.permission_mode),
+    )
+
+
+def _close_session(request: RunRequest) -> None:
+    """Best-effort teardown. A leaked session costs a stale record, not a run.
+
+    ``sessions close`` takes the name POSITIONALLY. Passing it with ``-s`` looks
+    right, is accepted, and closes nothing — it reports "No cwd session".
+    """
+    try:
+        subprocess.run(
+            [
+                request.acpx_bin,
+                "--cwd",
+                request.working_directory,
+                request.worker,
+                "sessions",
+                "close",
+                _session_name(request),
+            ],
+            cwd=request.working_directory,
+            capture_output=True,
+            text=True,
+            timeout=CONTROL_TIMEOUT_SECONDS,
+            env=_build_environment(),
+        )
+    except Exception:
+        pass
 
 
 def _spawn(command: List[str], working_directory: str) -> subprocess.Popen:
@@ -561,22 +674,41 @@ def _close_pipes(process: subprocess.Popen) -> None:
 
 
 def _write_lease(lease_id: str, pid: int, worker: str, working_directory: str) -> Optional[str]:
+    """Publish this delegation's child pid where ``safe-restart.sh`` will find it.
+
+    Written to a sibling temp file and renamed, never opened in place. The reader
+    is a shell ``sed`` that cannot distinguish a half-written lease from a
+    corrupt one, and it answers "unreadable" by aborting the restart — so a
+    truncating ``open(path, "w")`` that lost the process before the flush would
+    leave a zero-byte file blocking every restart from then on, with no owner
+    left alive to clean it up. ``os.replace`` is atomic within a directory, so a
+    concurrent reader sees either no lease or a complete one.
+
+    The temp file deliberately ends in ``.tmp``: the reader globs ``*.json``, and
+    a temp name it could match would reintroduce the same partial read.
+    """
     directory = lease_directory()
+    path = os.path.join(directory, "{}.json".format(lease_id))
+    staging = "{}.tmp".format(path)
     try:
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, "{}.json".format(lease_id))
         payload = {
             "pid": pid,
             "worker": worker,
             "cwd": working_directory,
             "started_at": time.time(),
         }
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(staging, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+        os.replace(staging, path)
         return path
     except OSError:
         # A missing lease weakens the restart guard but must never fail the
         # delegation the operator actually asked for.
+        try:
+            os.remove(staging)
+        except OSError:
+            pass
         return None
 
 

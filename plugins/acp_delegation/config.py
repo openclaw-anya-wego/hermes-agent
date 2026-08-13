@@ -59,6 +59,20 @@ DEFAULT_KIND_POLICY: Dict[str, Any] = {
     "defaultAction": "deny",
 }
 
+# The ACP session mode the worker runs in.
+#
+# "auto" lets the worker's own model classifier approve or deny each action.
+# That is what makes a review possible at all: reviewing code means running
+# `git`, `gh` and tests, which are `execute`, and the kind policy above denies
+# `execute` — acpx matches kinds and never paths, so approving it there would
+# approve every command anywhere.
+#
+# The two gates are sequential, not additive. A worker only asks acpx about
+# actions it did not settle itself, so in "auto" mode the policy above becomes
+# the backstop for whatever the classifier escalates rather than the first and
+# only word. Set "default" to restore prompt-everything behaviour.
+DEFAULT_PERMISSION_MODE = "auto"
+
 
 class ConfigurationError(Exception):
     """A request or a setting this plugin refuses to guess at.
@@ -82,6 +96,7 @@ class Settings:
     max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS
     kind_policy: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_KIND_POLICY))
     project_markers: List[str] = field(default_factory=lambda: list(DEFAULT_PROJECT_MARKERS))
+    permission_mode: str = DEFAULT_PERMISSION_MODE
 
     def clamp_timeout(self, requested: Optional[int]) -> int:
         if not requested:
@@ -118,6 +133,7 @@ def load_settings(hermes_config: Optional[Dict[str, Any]]) -> Settings:
         ),
         kind_policy=entry.get("kind_policy") or dict(DEFAULT_KIND_POLICY),
         project_markers=_clean_markers(entry.get("project_markers")),
+        permission_mode=(entry.get("permission_mode") or DEFAULT_PERMISSION_MODE).strip(),
     )
 
 
