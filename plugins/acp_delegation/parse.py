@@ -76,6 +76,17 @@ class Usage:
 
 
 @dataclass
+class ProtocolError:
+    """A JSON-RPC error reply — the worker's own account of why it stopped."""
+
+    code: Optional[int]
+    message: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"code": self.code, "message": self.message}
+
+
+@dataclass
 class Transcript:
     """Everything worth keeping from one acpx run."""
 
@@ -93,6 +104,11 @@ class Transcript:
     # blocks for up to 90 minutes, so without this the host has no evidence the
     # run is alive and cannot tell a working worker from a hung one.
     last_activity: Optional[str] = None
+    # Why the run stopped, in the worker's own words. Kept because acpx reports
+    # a refusal — an expired login, a rejected model — as a JSON-RPC error on
+    # the protocol stream and NOT on stderr. Dropping it left "exit 1" as the
+    # only evidence, and the agent then reported a guess as a cause.
+    protocol_error: Optional[ProtocolError] = None
 
     @property
     def text(self) -> str:
@@ -123,6 +139,12 @@ def consume_line(transcript: Transcript, raw_line: str) -> None:
         _consume_permission_request(transcript, message.get("params", {}))
         return
     if method is None:
+        # A JSON-RPC reply carries "result" OR "error", never both. Reading only
+        # "result" is what silently discarded the one line that said why a run
+        # failed.
+        if "error" in message:
+            _consume_protocol_error(transcript, message.get("error"))
+            return
         _consume_result(transcript, message.get("result"))
 
 
@@ -167,7 +189,7 @@ def build_result(
 
     if exit_code != EXIT_OK:
         return _failure(
-            _EXIT_MESSAGES.get(exit_code, "acpx exited with code {}.".format(exit_code)),
+            _exit_message(exit_code, transcript),
             _EXIT_ERROR_TYPES.get(exit_code, "unknown_exit"),
             transcript,
             exit_code,
@@ -233,7 +255,7 @@ def _failure(
     stderr_tail: str,
 ) -> Dict[str, Any]:
     partial, truncated = _truncate(transcript.text, max_response_chars)
-    return {
+    payload = {
         "success": False,
         "error": message,
         "error_type": error_type,
@@ -243,6 +265,12 @@ def _failure(
         "permission_requests": [r.as_dict() for r in transcript.permission_requests],
         "stderr_tail": stderr_tail,
     }
+    if transcript.protocol_error is not None:
+        # Also carried structurally, not only folded into the prose. acpx sends
+        # this on the protocol stream rather than stderr, so stderr_tail is
+        # empty for exactly the failures where the cause matters most.
+        payload["protocol_error"] = transcript.protocol_error.as_dict()
+    return payload
 
 
 def _truncate(text: str, max_chars: int) -> tuple:
@@ -400,6 +428,40 @@ def _consume_permission_request(transcript: Transcript, params: Dict[str, Any]) 
             title=tool_call.get("title", ""),
             file_path=tool_call.get("rawInput", {}).get("file_path"),
         )
+    )
+
+
+def _exit_message(exit_code: int, transcript: Transcript) -> str:
+    """The failure, said as specifically as the evidence allows.
+
+    The generic text for exit 1 lists three possible causes and cannot choose
+    between them, which is a fine label and a useless diagnosis: an agent handed
+    "an agent, protocol, or runtime error" and nothing else will pick one and
+    report it as the cause. When the worker said why, say that instead.
+    """
+    generic = _EXIT_MESSAGES.get(exit_code, "acpx exited with code {}.".format(exit_code))
+    error = transcript.protocol_error
+    if error is None:
+        return generic
+    code = " ({})".format(error.code) if error.code is not None else ""
+    return "The worker refused the request: {}{}.".format(error.message, code)
+
+
+def _consume_protocol_error(transcript: Transcript, error: Any) -> None:
+    """Keep the LAST error reply.
+
+    Earlier ones can be routine — a capability probe the adapter declines — so
+    the one that matters is the one nothing recovered from.
+    """
+    if not isinstance(error, dict):
+        return
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return
+    code = error.get("code")
+    transcript.protocol_error = ProtocolError(
+        code=code if isinstance(code, int) else None,
+        message=message.strip(),
     )
 
 

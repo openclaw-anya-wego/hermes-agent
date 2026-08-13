@@ -1992,20 +1992,22 @@ class TestSendTyping:
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
-            status="is pouncing… 🐾",
-            # ANYA-PATCH: the same phrase drives Slack's inline indicator too,
-            # which otherwise falls back to its own rotating placeholders.
+            # ANYA-PATCH: the phrase drives Slack's INLINE indicator, which
+            # otherwise falls back to its own rotating placeholders. The
+            # composer footer is left blank so it is not said twice.
+            status="",
             loading_messages=["is pouncing… 🐾"],
         )
 
     @pytest.mark.asyncio
-    async def test_keeps_the_composer_status_when_loading_messages_is_rejected(self):
-        """ANYA-PATCH. A workspace or SDK without loading_messages must not
-        cost us the status line we already had.
+    async def test_falls_back_to_the_composer_when_loading_messages_is_rejected(self):
+        """ANYA-PATCH. A workspace or SDK without loading_messages must still
+        get a status somewhere.
 
         The whole call sits inside a bare except that falls back to reactions,
-        so without the retry a rejected argument would silently disable both
-        surfaces — trading a working one for a new one.
+        so without this retry a rejected argument leaves no status at all. The
+        retry deliberately puts the phrase back on the composer footer: one
+        surface in the wrong place beats none.
         """
         config = PlatformConfig(
             enabled=True, token="xoxb-fake-token",
@@ -2113,7 +2115,7 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="171.000",
-            status="is thinking...",
+            status="",
             loading_messages=["is thinking..."],
         )
 
