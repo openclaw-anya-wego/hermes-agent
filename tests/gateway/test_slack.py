@@ -1992,66 +1992,9 @@ class TestSendTyping:
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
-            # ANYA-PATCH: the live phrase drives Slack's INLINE indicator, which
-            # otherwise falls back to its own rotating placeholders. The footer
-            # gets a constant so the same sentence is not shown twice — and it
-            # must not be blank, which is the clear signal.
-            status=SlackAdapter.WORKING_STATUS,
-            loading_messages=["is pouncing… 🐾"],
+            status="is pouncing… 🐾",
         )
 
-    @pytest.mark.asyncio
-    async def test_never_sends_an_empty_status_while_working(self):
-        """An empty status is how stop_typing CLEARS the indicator.
-
-        Sending one from send_typing took BOTH surfaces down — no footer line
-        and no inline line — and looked like the feature had been removed. This
-        is the assertion that shipped one commit too late.
-        """
-        config = PlatformConfig(enabled=True, token="xoxb-fake-token")
-        a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        a._status_text = {"C123": "claude worker: Run bun test"}
-
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-
-        kwargs = a._app.client.assistant_threads_setStatus.call_args.kwargs
-        assert kwargs["status"], "an empty status clears the indicator entirely"
-        assert kwargs["loading_messages"] == ["claude worker: Run bun test"]
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_the_composer_when_loading_messages_is_rejected(self):
-        """ANYA-PATCH. A workspace or SDK without loading_messages must still
-        get a status somewhere.
-
-        The whole call sits inside a bare except that falls back to reactions,
-        so without this retry a rejected argument leaves no status at all. The
-        retry deliberately puts the phrase back on the composer footer: one
-        surface in the wrong place beats none.
-        """
-        config = PlatformConfig(
-            enabled=True, token="xoxb-fake-token",
-            typing_status_text="is pouncing… 🐾",
-        )
-        a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
-        calls = []
-
-        async def picky(**kwargs):
-            calls.append(kwargs)
-            if "loading_messages" in kwargs:
-                raise TypeError("unexpected keyword argument 'loading_messages'")
-
-        a._app.client.assistant_threads_setStatus = AsyncMock(side_effect=picky)
-
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-
-        assert len(calls) == 2
-        assert "loading_messages" not in calls[1]
-        assert calls[1]["status"] == "is pouncing… 🐾"
 
     @pytest.mark.asyncio
     async def test_live_status_beats_configured_static_text(self):
@@ -2137,8 +2080,7 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="171.000",
-            status=SlackAdapter.WORKING_STATUS,
-            loading_messages=["is thinking..."],
+            status="is thinking...",
         )
 
 
