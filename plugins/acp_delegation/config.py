@@ -133,8 +133,24 @@ def load_settings(hermes_config: Optional[Dict[str, Any]]) -> Settings:
         ),
         kind_policy=entry.get("kind_policy") or dict(DEFAULT_KIND_POLICY),
         project_markers=_clean_markers(entry.get("project_markers")),
-        permission_mode=(entry.get("permission_mode") or DEFAULT_PERMISSION_MODE).strip(),
+        permission_mode=_permission_mode(entry.get("permission_mode")),
     )
+
+
+def _permission_mode(raw: Any) -> str:
+    """The configured session mode, or the default for anything unusable.
+
+    Type-checked rather than `.strip()`ed directly. `permission_mode: off` is a
+    plausible thing for an operator to write and YAML parses it as the BOOLEAN
+    False, so calling a string method on it raises AttributeError — out through
+    `load_settings`, past `handle_acp_delegate`, which catches only
+    ConfigurationError, and out of `acpx_is_available` too, which the registry
+    calls every turn. A malformed setting must degrade to the default, never
+    take the tool off the model's list.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return DEFAULT_PERMISSION_MODE
+    return raw.strip()
 
 
 def resolve_working_directory(

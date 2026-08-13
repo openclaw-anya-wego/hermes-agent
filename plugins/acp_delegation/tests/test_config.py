@@ -59,6 +59,47 @@ class LoadSettingsTests(unittest.TestCase):
         with self.assertRaises(config.ConfigurationError):
             config.load_settings(config_with(allowed_cwd_roots="/tmp"))
 
+    def test_a_non_string_permission_mode_does_not_crash_the_tool(self):
+        """Calling a string method on a YAML scalar that is not a string.
+
+        The value has to be TRUTHY to reach `.strip()` — `permission_mode: off`
+        parses as False, which the `or` already absorbs. `permission_mode: 2`,
+        a list, or a nested mapping does not, and AttributeError then escapes
+        load_settings, escapes handle_acp_delegate — it catches only
+        ConfigurationError — and escapes acpx_is_available, which the registry
+        calls every turn. A malformed setting must degrade to the default, not
+        take the tool off the model's list.
+        """
+        for value in (2, ["auto"], {"mode": "auto"}, True):
+            with self.subTest(value=value):
+                settings = config.load_settings(
+                    config_with(allowed_cwd_roots=["/tmp"], permission_mode=value)
+                )
+
+                self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+
+    def test_a_falsy_permission_mode_also_uses_the_default(self):
+        """`permission_mode: off` and `permission_mode: ""` both mean unset."""
+        for value in (False, "", None, "   "):
+            with self.subTest(value=value):
+                settings = config.load_settings(
+                    config_with(allowed_cwd_roots=["/tmp"], permission_mode=value)
+                )
+
+                self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+
+    def test_an_unset_permission_mode_uses_the_default(self):
+        settings = config.load_settings(config_with(allowed_cwd_roots=["/tmp"]))
+
+        self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+
+    def test_a_configured_permission_mode_is_honoured(self):
+        settings = config.load_settings(
+            config_with(allowed_cwd_roots=["/tmp"], permission_mode="  plan  ")
+        )
+
+        self.assertEqual(settings.permission_mode, "plan")
+
 
 class ClampTimeoutTests(unittest.TestCase):
     def setUp(self):

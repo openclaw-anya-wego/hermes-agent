@@ -128,9 +128,21 @@ def run(request: RunRequest, host_progress: Optional[HostProgress] = None) -> Ru
     # A named session, not a one-shot `exec`. The mode can only be set on a
     # session, and the mode is what decides whether the worker may run anything
     # at all — see _open_session.
+    #
+    # Closed on EVERY path out of here, including the two before the main try
+    # block below is entered. `_open_session` creates the session and then sets
+    # the mode as a second call, so a rejected mode raises with the session
+    # already created; `_spawn` can fail with it created AND configured. Both
+    # would otherwise leave an `acp-<uuid>` record behind per attempt, and the
+    # failure that causes it is the repeatable kind — an adapter that does not
+    # know the mode id fails identically every time.
     _open_session(request)
-    command = _build_command(request)
-    process = _spawn(command, request.working_directory)
+    try:
+        command = _build_command(request)
+        process = _spawn(command, request.working_directory)
+    except BaseException:
+        _close_session(request)
+        raise
 
     lease_path = _write_lease(
         request.lease_id, process.pid, request.worker, request.working_directory
@@ -276,11 +288,20 @@ def _open_session(request: RunRequest) -> None:
     )
     if not request.permission_mode:
         return
-    _control(
-        request,
-        [request.worker, "-s", session, "set-mode", request.permission_mode],
-        "acpx could not set the worker's mode to '{}'".format(request.permission_mode),
-    )
+    # The session already exists by this point, so a rejected mode must take it
+    # back down. acpx documents that an adapter rejects an unsupported mode id,
+    # and that failure repeats on every attempt — leaving the record behind
+    # would accumulate one dead session per delegation for as long as the
+    # misconfiguration lasts.
+    try:
+        _control(
+            request,
+            [request.worker, "-s", session, "set-mode", request.permission_mode],
+            "acpx could not set the worker's mode to '{}'".format(request.permission_mode),
+        )
+    except BaseException:
+        _close_session(request)
+        raise
 
 
 def _close_session(request: RunRequest) -> None:
@@ -598,6 +619,14 @@ class _ProgressRelay:
         if self._report_status is None or activity is None:
             return
         if activity.text == self._last_reported:
+            # Unchanged phrase, but not necessarily the same ACTION: claude
+            # opens every call with the same placeholder title, so two
+            # consecutive Bash calls are textually identical right here. Follow
+            # the newer call anyway. Returning without it leaves the id on the
+            # previous call, so the new one's real description is not recognised
+            # as a refinement and gets throttled — the exact case the bypass
+            # below exists for.
+            self._last_reported_call_id = activity.call_id
             return
 
         # A REFINEMENT of the action already on the line bypasses the throttle.

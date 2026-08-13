@@ -363,6 +363,28 @@ class StatusRefinementTests(unittest.TestCase):
 
         self.assertEqual(self.reported, ["Read a.java", "Edit b.java"])
 
+    def test_the_second_call_with_the_same_placeholder_still_refines(self):
+        """The dedupe must follow the call, not only the phrase.
+
+        Two consecutive Bash calls both open as "Terminal", so the second is
+        absorbed by the text dedupe. If that path forgets to advance the call
+        id, the second call's real description is measured against the FIRST
+        call's id, reads as a new action, and gets throttled — silently undoing
+        the bypass for every tool call after the first.
+        """
+        self.relay.consider(self.event("t1", "Terminal"))
+        self.relay.consider(self.event("t2", "Terminal"))
+        self.relay.consider(
+            self.event(
+                "t2",
+                "gh pr view 1504",
+                {"command": "gh pr view 1504", "description": "Get PR #1504 metadata"},
+                kind="tool_call_update",
+            )
+        )
+
+        self.assertEqual(self.reported, ["Terminal", "Get PR #1504 metadata"])
+
     def test_a_repeated_refinement_does_not_report_twice(self):
         """claude sends the description twice — once alone, once with content."""
         described = self.event(
@@ -628,6 +650,21 @@ class SessionModeTests(ProcessTestCase):
             self.run_task(binary)
 
         self.assertIn("mode", str(caught.exception))
+
+    def test_a_failed_mode_change_still_closes_the_session(self):
+        """The session exists by then, and this failure repeats every time.
+
+        An adapter that does not know the mode id rejects it identically on
+        every delegation, so leaving the record behind accumulates one dead
+        session per attempt for as long as the misconfiguration lasts.
+        """
+        binary, log = self.recording_acpx(mode_exit=1)
+
+        with self.assertRaises(acpx_process.SpawnError):
+            self.run_task(binary)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions close acp-" in c for c in calls), calls)
 
     def test_the_session_name_carries_the_run_id(self):
         """The lease, the settings overlay and the session share one id, so the
