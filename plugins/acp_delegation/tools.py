@@ -8,16 +8,24 @@ configuration rules testable without a Hermes install.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tools.registry import tool_error, tool_result
 
 from plugins.acp_delegation import acpx_process, config, parse, settings_overlay
 
 SUPPORTED_WORKERS = ["claude", "pi"]
+
+# A slash command must be a single token-led line. The shape is enforced here
+# rather than described in the schema because the split between `command` and
+# `task` only pays off if it cannot be collapsed back: a multi-line value becomes
+# a second instruction competing with `task`, and nothing in the result would say
+# which one the worker followed.
+COMMAND_PATTERN = re.compile(r"^/\S+")
 
 # Path-level denies, enforced by the worker's own settings because acpx matches
 # tool kinds and never paths.
@@ -75,11 +83,25 @@ ACP_DELEGATE_SCHEMA = {
                     "one you pick is unavailable, the call fails and you choose again."
                 ),
             },
+            "command": {
+                "type": "string",
+                "pattern": "^/\\S+",
+                "description": (
+                    "Optional slash command for the worker to run, with its arguments — e.g. "
+                    "'/saber-code-review #1234'. This also invokes a skill, since user-invocable "
+                    "skills are slash commands. The procedure lives in the command file on the "
+                    "worker: name it here and do NOT restate its steps in 'task'. One line only. "
+                    "Commands resolve from the project, so one that exists in a given checkout "
+                    "may not exist in another."
+                ),
+            },
             "task": {
                 "type": "string",
                 "description": (
-                    "The complete task: what to change, where, and what done looks like. "
-                    "Include any context the worker needs, because it cannot ask."
+                    "The brief: what to change, where, and what done looks like. With a "
+                    "'command', this is the context that command needs — the reference, the "
+                    "constraints, the acceptance criteria — not a copy of its procedure. "
+                    "Include everything the worker needs, because it cannot ask."
                 ),
             },
             "cwd": {
@@ -124,7 +146,7 @@ def handle_acp_delegate(args: Dict[str, Any], **kwargs) -> str:
         outcome = acpx_process.run(
             acpx_bin=settings.acpx_bin,
             worker=request["worker"],
-            task=request["task"],
+            task=request["prompt"],
             working_directory=request["cwd"],
             timeout_seconds=request["timeout_seconds"],
             kind_policy=settings.kind_policy,
@@ -177,14 +199,57 @@ def _validate(args: Dict[str, Any], settings: config.Settings) -> Dict[str, Any]
     if not task:
         raise config.ConfigurationError("task is required and cannot be empty.", "invalid_task")
 
+    command = _validated_command(args.get("command"))
+
     return {
         "worker": worker,
+        "command": command,
         "task": task,
+        "prompt": _compose_prompt(command, task),
         "cwd": config.resolve_working_directory(
             args.get("cwd") or "", settings.allowed_cwd_roots, settings.project_markers
         ),
         "timeout_seconds": settings.clamp_timeout(args.get("timeout_seconds")),
     }
+
+
+def _validated_command(raw: Any) -> Optional[str]:
+    """Accept a single slash-command line, or nothing at all.
+
+    Absent is normal — a plain brief is a valid delegation. What is refused is a
+    value shaped like something else, because a command the worker cannot expand
+    is pasted into the prompt verbatim and improvised around, which reads as
+    success.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise config.ConfigurationError("command must be a string.", "invalid_command")
+
+    command = raw.strip()
+    if not command:
+        return None
+    if "\n" in command or "\r" in command:
+        raise config.ConfigurationError(
+            "command must be a single line. Put the brief in 'task'.", "invalid_command"
+        )
+    if not COMMAND_PATTERN.match(command):
+        raise config.ConfigurationError(
+            "command must start with '/' followed by the command name, "
+            "e.g. '/saber-code-review #1234'.",
+            "invalid_command",
+        )
+    return command
+
+
+def _compose_prompt(command: Optional[str], task: str) -> str:
+    """The command first, then the brief — the shape the worker expands.
+
+    Matches what `worker-delegate/spawn.md` has been sending in production: the
+    procedure comes from the command file on the worker, and the brief supplies
+    only what that procedure needs.
+    """
+    return "{}\n{}".format(command, task) if command else task
 
 
 def _format(
@@ -202,6 +267,11 @@ def _format(
     result["worker"] = request["worker"]
     result["cwd"] = request["cwd"]
     result["duration_seconds"] = round(elapsed_seconds, 1)
+    if request["command"]:
+        # Echoed so a result can be read against what was asked for. Commands
+        # resolve per project, so "which command ran" is not inferable from the
+        # call site alone.
+        result["command"] = request["command"]
 
     # tool_result accepts a dict or keyword arguments, never both, so "success"
     # has to travel inside the payload rather than alongside it.

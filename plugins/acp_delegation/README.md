@@ -83,12 +83,39 @@ same thing to all of them. Projects that are not checkouts are what
 ## The tool
 
 ```
-acp_delegate(worker="claude"|"pi", task="...", cwd="/abs/path", timeout_seconds=900)
+acp_delegate(worker="claude"|"pi", task="...", cwd="/abs/path",
+             command="/saber-code-review #1234", timeout_seconds=900)
 ```
 
 `worker` is required and has no default. There is no automatic fallback between
 the two: a failover that guesses is how Anya's own breaker learned to blame one
 worker for another's usage cap.
+
+### command and task are separate on purpose
+
+The prompt sent to the worker is `command + "\n" + task` — the shape
+`skills/worker-delegate/spawn.md` has been sending in production. The procedure
+lives in the command file on the worker; `task` supplies only what that procedure
+needs.
+
+A dedicated field rather than "start your task with a slash command" is the
+finding from CLAUDE.md rule 10, measured over five live runs: every **template
+slot** was filled correctly, and every requirement written as **prose inside a
+step** fired zero times. A schema property is a slot. A sentence in a description
+is prose — which is also why the single-line shape is enforced in the handler and
+not merely described.
+
+`command` also covers **skills**, because a user-invocable skill is a slash
+command. It does not cover **subagents**: there is no `/agent-name` surface, so
+the only way to make one run is a command file that invokes it. A tool argument
+named `agent` would promise something only prose could attempt, and this plugin
+already refuses that shape once — see `_deny_rules_for`.
+
+Commands resolve from the project, so one that exists in a given checkout may not
+exist in another. The plugin cannot tell: an unexpandable command is pasted into
+the prompt verbatim and improvised around, which reads as success. The session
+does emit `available_commands_update`, so detecting this is possible — it is not
+implemented.
 
 ## Two permission layers, because one is not enough
 
@@ -169,7 +196,7 @@ writes, so a total-token guard can never fire. `tests/test_parse.py` pins this.
 | `error_type` | Meaning |
 | --- | --- |
 | `not_configured` | `allowed_cwd_roots` is unset. Operator action. |
-| `invalid_worker` / `invalid_task` / `invalid_cwd` | The call was wrong. Retry differently. |
+| `invalid_worker` / `invalid_task` / `invalid_cwd` / `invalid_command` | The call was wrong. Retry differently. |
 | `acpx_not_found` / `spawn_failed` | acpx could not be started. |
 | `agent_error` | acpx exit 1 — adapter, protocol, or runtime fault. |
 | `cli_usage_error` | acpx exit 2. A plugin bug: it built bad arguments. |

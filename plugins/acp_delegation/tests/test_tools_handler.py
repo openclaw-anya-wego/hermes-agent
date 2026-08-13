@@ -104,6 +104,83 @@ class ValidationTests(HandlerTestCase):
         self.assertEqual(self.calls, [])
 
 
+class CommandTests(HandlerTestCase):
+    """The slash command is a separate slot, not a convention inside `task`.
+
+    Measured on `draft-github-issue` over five runs: every template slot was
+    filled, and every requirement written as prose fired zero times. A schema
+    property is a slot; a sentence in a description is prose.
+    """
+
+    def prompt(self):
+        return self.calls[0]["task"]
+
+    def test_puts_the_command_before_the_brief(self):
+        self.stub_run(outcome())
+
+        self.delegate(command="/saber-code-review #1234", task="focus on the parser")
+
+        self.assertEqual(self.prompt(), "/saber-code-review #1234\nfocus on the parser")
+
+    def test_sends_the_brief_alone_when_no_command_is_given(self):
+        self.stub_run(outcome())
+
+        self.delegate(task="just fix it")
+
+        self.assertEqual(self.prompt(), "just fix it")
+
+    def test_echoes_the_command_in_the_result(self):
+        """Commands resolve per project, so the call site does not say which ran."""
+        self.stub_run(outcome())
+
+        result = self.delegate(command="/deploy-mini", task="ship it")
+
+        self.assertEqual(result["command"], "/deploy-mini")
+
+    def test_omits_the_command_from_a_result_that_had_none(self):
+        self.stub_run(outcome())
+
+        self.assertNotIn("command", self.delegate(task="just fix it"))
+
+    def test_accepts_a_command_for_either_worker(self):
+        self.stub_run(outcome())
+
+        self.delegate(worker="pi", command="/review", task="look at it")
+
+        self.assertTrue(self.prompt().startswith("/review\n"))
+
+    def test_rejects_a_command_that_is_not_a_command(self):
+        self.assertEqual(
+            self.delegate(command="saber-code-review")["error_type"], "invalid_command"
+        )
+
+    def test_rejects_a_multi_line_command(self):
+        """Otherwise it becomes a second instruction competing with `task`."""
+        result = self.delegate(command="/review\nand also rewrite the tests")
+
+        self.assertEqual(result["error_type"], "invalid_command")
+
+    def test_rejects_a_bare_slash(self):
+        self.assertEqual(self.delegate(command="/")["error_type"], "invalid_command")
+
+    def test_rejects_a_command_that_is_not_a_string(self):
+        self.assertEqual(self.delegate(command={"name": "/x"})["error_type"], "invalid_command")
+
+    def test_treats_a_blank_command_as_absent(self):
+        self.stub_run(outcome())
+
+        self.delegate(command="   ", task="just fix it")
+
+        self.assertEqual(self.prompt(), "just fix it")
+
+    def test_never_spawns_acpx_for_a_malformed_command(self):
+        self.stub_run(outcome())
+
+        self.delegate(command="not a command")
+
+        self.assertEqual(self.calls, [])
+
+
 class SuccessTests(HandlerTestCase):
     def test_returns_the_workers_reply_and_context(self):
         self.stub_run(outcome(text="all done"))
