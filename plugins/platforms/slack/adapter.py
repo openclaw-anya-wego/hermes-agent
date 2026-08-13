@@ -884,6 +884,14 @@ class SlackAdapter(BasePlatformAdapter):
     # Slack's typing indicator is a text status line (assistant.threads
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
+    # ANYA-PATCH. What the composer footer says while the inline indicator
+    # carries the live phrase. The footer is where Slack shows "<name> is
+    # typing…" for a person, so the agent says the same thing there and reads as
+    # an ordinary participant; what it is actually doing goes inline.
+    #
+    # Deliberately constant, and deliberately NOT empty: an empty status is the
+    # clear signal, and sending one here shows nothing on either surface.
+    WORKING_STATUS = "is typing..."
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
@@ -2963,29 +2971,31 @@ class SlackAdapter(BasePlatformAdapter):
           status           the line beneath the reply composer
           loading_messages the indicator INLINE in the message list
 
-        Only the inline one is used. Sending the phrase to both puts the same
-        sentence on screen twice, a few centimetres apart, and the inline one
-        wins on placement: it sits with the conversation the operator is already
-        reading, where the composer footer is easy to miss entirely.
+        The live phrase goes to the inline one, because it sits with the
+        conversation the operator is already reading. Passing no
+        ``loading_messages`` leaves that surface to Slack's own rotating
+        placeholders — "Processing…", "Searching…" — which say nothing about
+        what this agent is doing.
 
-        Passing no ``loading_messages`` at all is what leaves the inline
-        indicator to Slack's own rotating placeholders — "Processing…",
-        "Searching…" — which say nothing about what this agent is doing.
+        ``status`` gets a short constant instead of the same sentence. It cannot
+        be blank: an empty status is how ``stop_typing`` CLEARS the indicator,
+        so sending "" here takes both surfaces down and the operator sees
+        nothing at all. It also should not repeat the phrase — that renders the
+        same sentence twice, a few centimetres apart. A fixed word satisfies
+        both: the footer says work is happening, the inline line says what.
 
         The retry is not defensive habit. The whole call sits inside a bare
         ``except`` that falls back to reactions, so a workspace or SDK that
         rejects ``loading_messages`` would otherwise leave NO status at all —
-        and the fallback deliberately restores the composer line, because one
-        surface in the wrong place beats none.
+        and the fallback deliberately puts the live phrase on the composer line,
+        because one surface in the wrong place beats none.
         """
         client = self._get_client(chat_id, team_id=team_id)
         try:
             await client.assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
-                # Blank, so the composer footer stays empty and the phrase
-                # appears once. The argument is required by the method.
-                status="",
+                status=self.WORKING_STATUS,
                 loading_messages=[status],
             )
         except Exception as e:
