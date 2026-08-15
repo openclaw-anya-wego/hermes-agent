@@ -262,6 +262,32 @@ class SuccessTests(HandlerTestCase):
         self.assertEqual(call["task"], "fix it")
         self.assertEqual(call["working_directory"], self.project)
 
+    def test_sends_claude_the_permission_mode_that_lets_it_execute(self):
+        """Without `auto` a review cannot run `git`, `gh` or tests."""
+        self.stub_run(outcome())
+
+        self.delegate(worker="claude")
+
+        self.assertEqual(self.calls[0]["permission_mode"], "auto")
+
+    def test_sends_pi_no_permission_mode(self):
+        """pi's adapter reads `modeId` as a thinking level, so a permission mode
+        comes back Invalid params and kills the run before the worker starts."""
+        self.stub_run(outcome())
+
+        self.delegate(worker="pi")
+
+        self.assertIsNone(self.calls[0]["permission_mode"])
+
+    def test_the_mode_follows_the_worker_and_nothing_else(self):
+        """The model chooses the worker, never the mode. Anything else it sends
+        is not a mode, and no argument may become one."""
+        self.stub_run(outcome())
+
+        self.delegate(worker="pi", permission_mode="auto", timeout_seconds=60)
+
+        self.assertIsNone(self.calls[0]["permission_mode"])
+
     def test_clamps_an_absurd_timeout_before_spawning(self):
         self.stub_run(outcome())
 

@@ -102,17 +102,20 @@ class ProcessTestCase(unittest.TestCase):
         timeout_seconds=30,
         grace_seconds=5,
         host_progress=None,
+        worker="claude",
+        permission_mode="auto",
     ):
         return acpx_process.run(
             acpx_process.RunRequest(
                 acpx_bin=binary,
-                worker="claude",
+                worker=worker,
                 task=task,
                 working_directory=self.workdir,
                 timeout_seconds=timeout_seconds,
                 kind_policy=KIND_POLICY,
                 grace_seconds=grace_seconds,
                 lease_id="testlease",
+                permission_mode=permission_mode,
             ),
             host_progress,
         )
@@ -633,6 +636,29 @@ class SessionModeTests(ProcessTestCase):
         self.assertTrue(any("sessions new --name acp-" in c for c in calls), calls)
         self.assertTrue(any("set-mode auto" in c for c in calls), calls)
 
+    def test_a_worker_with_no_mode_gets_a_session_and_no_set_mode(self):
+        """pi's regression. Its adapter reads `modeId` as a thinking level, so
+        any permission mode comes back Invalid params (ACP -32602) and the whole
+        delegation dies at session setup. The session still has to be created —
+        only the mode call is skipped.
+        """
+        binary, log = self.recording_acpx()
+
+        self.run_task(binary, worker="pi", permission_mode=None)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions new --name acp-" in c for c in calls), calls)
+        self.assertFalse(any("set-mode" in c for c in calls), calls)
+
+    def test_a_worker_with_no_mode_still_closes_its_session(self):
+        """Skipping the mode must not skip the teardown that followed it."""
+        binary, log = self.recording_acpx()
+
+        self.run_task(binary, worker="pi", permission_mode=None)
+
+        calls = self.control_calls(log)
+        self.assertTrue(any("sessions close acp-" in c for c in calls), calls)
+
     def test_closes_the_session_afterwards(self):
         binary, log = self.recording_acpx()
 
@@ -681,7 +707,10 @@ class SessionModeTests(ProcessTestCase):
         )
 
         self.assertEqual(acpx_process._session_name(request), "acp-deadbeef")
-        self.assertEqual(request.permission_mode, "auto")
+        # No mode unless the caller names one. The right mode is a property of
+        # the worker's adapter, and a dataclass default would hand Claude's to
+        # whoever forgot to look it up.
+        self.assertIsNone(request.permission_mode)
 
 
 class CommandTests(ProcessTestCase):

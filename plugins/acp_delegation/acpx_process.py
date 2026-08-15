@@ -101,7 +101,10 @@ class RunRequest:
     kind_policy: Dict[str, Any]
     grace_seconds: int
     lease_id: str
-    permission_mode: str = "auto"
+    # None means "open the session and set no mode". Not defaulted to a mode:
+    # the right one is a property of the worker's adapter, which only the caller
+    # knows — see config.PERMISSION_MODES.
+    permission_mode: Optional[str] = None
 
 
 class HostProgress(NamedTuple):
@@ -263,18 +266,20 @@ def _control(request: RunRequest, arguments: List[str], failure: str) -> None:
 
 
 def _open_session(request: RunRequest) -> None:
-    """Create the session and set the mode the worker runs under.
+    """Create the session, and set a mode when this worker has one.
 
-    Both are needed before the prompt, and the mode is the point. acpx sets none
-    — its bundle contains no mode ids at all — so the worker starts in the
-    adapter's ``default`` mode, asks about every action, and acpx answers from
-    ``--permission-policy``. That policy matches tool KINDS and never paths, so
-    it cannot allow "run git" without also allowing "run anything"; denying
-    ``execute`` is what left a review worker unable to run ``git status``.
+    For Claude the mode is the point. acpx sets none — its bundle contains no
+    mode ids at all — so the worker starts in the adapter's ``default`` mode,
+    asks about every action, and acpx answers from ``--permission-policy``. That
+    policy matches tool KINDS and never paths, so it cannot allow "run git"
+    without also allowing "run anything"; denying ``execute`` is what left a
+    review worker unable to run ``git status``. ``auto`` moves the judgement back
+    into the worker, which decides per action and mostly never asks.
 
-    ``auto`` moves the judgement back into the worker, which decides per action
-    and mostly never asks — leaving the kind policy as the backstop for what it
-    does escalate, rather than the first and only word.
+    ``permission_mode`` is None for a worker whose adapter has no permission mode
+    to set, and the session then opens without one. That is a configuration and
+    not an omission: pi has no approval gate to select, and its ``set_mode`` slot
+    holds the thinking level instead — see ``config.PERMISSION_MODES``.
 
     A failure here raises rather than warns. Continuing in the wrong mode
     reproduces the original fault exactly: a worker that cannot act, reporting

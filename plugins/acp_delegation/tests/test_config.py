@@ -59,46 +59,59 @@ class LoadSettingsTests(unittest.TestCase):
         with self.assertRaises(config.ConfigurationError):
             config.load_settings(config_with(allowed_cwd_roots="/tmp"))
 
-    def test_a_non_string_permission_mode_does_not_crash_the_tool(self):
-        """Calling a string method on a YAML scalar that is not a string.
+    def test_a_permission_mode_in_the_config_is_ignored(self):
+        """The mode is a property of the adapter, so config cannot set it.
 
-        The value has to be TRUTHY to reach `.strip()` — `permission_mode: off`
-        parses as False, which the `or` already absorbs. `permission_mode: 2`,
-        a list, or a nested mapping does not, and AttributeError then escapes
-        load_settings, escapes handle_acp_delegate — it catches only
-        ConfigurationError — and escapes acpx_is_available, which the registry
-        calls every turn. A malformed setting must degrade to the default, not
-        take the tool off the model's list.
+        It used to be a setting, and one setting cannot be right for two
+        adapters: `session/set_mode` carries a permission mode for Claude and a
+        thinking level for pi. Whatever an operator leaves in `config.yaml` from
+        the old shape must not reach a worker.
         """
-        for value in (2, ["auto"], {"mode": "auto"}, True):
+        for value in ("auto", "plan", {"pi": "auto"}, 2, False, None):
             with self.subTest(value=value):
                 settings = config.load_settings(
                     config_with(allowed_cwd_roots=["/tmp"], permission_mode=value)
                 )
 
-                self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+                self.assertFalse(hasattr(settings, "permission_mode"))
+                self.assertFalse(hasattr(settings, "permission_modes"))
+                self.assertEqual(config.permission_mode_for("claude"), "auto")
+                self.assertIsNone(config.permission_mode_for("pi"))
 
-    def test_a_falsy_permission_mode_also_uses_the_default(self):
-        """`permission_mode: off` and `permission_mode: ""` both mean unset."""
-        for value in (False, "", None, "   "):
-            with self.subTest(value=value):
-                settings = config.load_settings(
-                    config_with(allowed_cwd_roots=["/tmp"], permission_mode=value)
-                )
 
-                self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+class PermissionModeTests(unittest.TestCase):
+    """Which session mode each worker's session opens with.
 
-    def test_an_unset_permission_mode_uses_the_default(self):
-        settings = config.load_settings(config_with(allowed_cwd_roots=["/tmp"]))
+    Not a setting: `session/set_mode` is one ACP method with two vocabularies,
+    so the value is only ever correct for the adapter it was written for.
+    """
 
-        self.assertEqual(settings.permission_mode, config.DEFAULT_PERMISSION_MODE)
+    def test_claude_runs_in_auto_so_it_can_execute(self):
+        """Without it a review cannot run `git`, `gh` or tests — the kind policy
+        denies `execute`, and `auto` moves that judgement into the worker."""
+        self.assertEqual(config.permission_mode_for("claude"), "auto")
 
-    def test_a_configured_permission_mode_is_honoured(self):
-        settings = config.load_settings(
-            config_with(allowed_cwd_roots=["/tmp"], permission_mode="  plan  ")
-        )
+    def test_pi_is_sent_no_mode_at_all(self):
+        """pi-acp reads `modeId` as pi's THINKING level and rejects anything
+        outside off|minimal|low|medium|high|xhigh. Claude's "auto" comes back
+        Invalid params (ACP -32602), which killed the delegation at session
+        setup before the worker ran a token. pi needs no permission mode: it has
+        no approval gate, and never asks the client to run a shell command.
+        """
+        self.assertIsNone(config.permission_mode_for("pi"))
 
-        self.assertEqual(settings.permission_mode, "plan")
+    def test_no_worker_is_sent_a_mode_meant_for_another(self):
+        """The failure this map exists to prevent. A mode id is adapter-defined,
+        so sharing one across workers is what broke pi in the first place."""
+        modes = [m for m in config.PERMISSION_MODES.values() if m is not None]
+
+        self.assertEqual(len(modes), len(set(modes)))
+
+    def test_an_unknown_worker_is_sent_no_mode(self):
+        """A borrowed default is worse than none: at best it means nothing to
+        the new adapter, at worst it kills every session it opens."""
+        self.assertIsNone(config.permission_mode_for("gemini"))
+        self.assertIsNone(config.permission_mode_for(""))
 
 
 class ClampTimeoutTests(unittest.TestCase):
