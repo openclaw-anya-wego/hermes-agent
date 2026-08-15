@@ -59,19 +59,53 @@ DEFAULT_KIND_POLICY: Dict[str, Any] = {
     "defaultAction": "deny",
 }
 
-# The ACP session mode the worker runs in.
+# The ACP session mode each worker's session is opened with.
 #
-# "auto" lets the worker's own model classifier approve or deny each action.
-# That is what makes a review possible at all: reviewing code means running
-# `git`, `gh` and tests, which are `execute`, and the kind policy above denies
-# `execute` — acpx matches kinds and never paths, so approving it there would
-# approve every command anywhere.
+# A fixed property of each adapter, not a setting. `session/set_mode` is one ACP
+# method carrying two unrelated vocabularies, so the value is only ever correct
+# for the adapter it was written for:
 #
-# The two gates are sequential, not additive. A worker only asks acpx about
-# actions it did not settle itself, so in "auto" mode the policy above becomes
-# the backstop for whatever the classifier escalates rather than the first and
-# only word. Set "default" to restore prompt-everything behaviour.
-DEFAULT_PERMISSION_MODE = "auto"
+#   claude  `modeId` is a PERMISSION mode. "auto" lets the worker's own model
+#           classifier approve or deny each action, which is what makes a review
+#           possible at all: reviewing code means running `git`, `gh` and tests,
+#           which are `execute`, and the kind policy above denies `execute` —
+#           acpx matches kinds and never paths, so approving it there would
+#           approve every command anywhere. The two gates are sequential, not
+#           additive: the worker only asks acpx about what it did not settle
+#           itself, leaving the kind policy as the backstop for escalations.
+#
+#   pi      `modeId` is pi's THINKING level. pi-acp's `setSessionMode` calls
+#           `setThinkingLevel`, and rejects anything outside
+#           `off|minimal|low|medium|high|xhigh`. Sending Claude's "auto" here
+#           returns Invalid params (ACP -32602) and killed every pi delegation
+#           at session setup, before the worker ran a token.
+#
+# ``None`` means "send no mode", which for pi is the answer rather than a gap.
+# pi has no permission model to select: it ships no sandbox and no approval
+# gate, and pi-acp never asks the client for permission to run a shell command,
+# so the kind policy above is never consulted for it either. pi can already do
+# what a review needs — "auto" exists to give Claude that same freedom, and the
+# thinking level is the worker's own configuration, not this plugin's business.
+#
+# Deliberately not configurable, and absent from the tool schema. There is no
+# value an operator or the model could supply that is right for both workers,
+# and the failure mode of getting it wrong is a delegation that dies before it
+# starts. Adding a worker means adding its mode here, next to the reason.
+PERMISSION_MODES: Dict[str, Optional[str]] = {
+    "claude": "auto",
+    "pi": None,
+}
+
+
+def permission_mode_for(worker: str) -> Optional[str]:
+    """The mode to open this worker's session with, or None to set none.
+
+    An unknown worker gets None rather than a borrowed default. Mode ids are
+    adapter-defined, so a value that suits one adapter is at best meaningless to
+    another and at worst fatal to the session. Sending nothing is the only
+    choice that is safe to guess.
+    """
+    return PERMISSION_MODES.get(worker)
 
 
 class ConfigurationError(Exception):
@@ -96,7 +130,6 @@ class Settings:
     max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS
     kind_policy: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_KIND_POLICY))
     project_markers: List[str] = field(default_factory=lambda: list(DEFAULT_PROJECT_MARKERS))
-    permission_mode: str = DEFAULT_PERMISSION_MODE
 
     def clamp_timeout(self, requested: Optional[int]) -> int:
         if not requested:
@@ -133,24 +166,7 @@ def load_settings(hermes_config: Optional[Dict[str, Any]]) -> Settings:
         ),
         kind_policy=entry.get("kind_policy") or dict(DEFAULT_KIND_POLICY),
         project_markers=_clean_markers(entry.get("project_markers")),
-        permission_mode=_permission_mode(entry.get("permission_mode")),
     )
-
-
-def _permission_mode(raw: Any) -> str:
-    """The configured session mode, or the default for anything unusable.
-
-    Type-checked rather than `.strip()`ed directly. `permission_mode: off` is a
-    plausible thing for an operator to write and YAML parses it as the BOOLEAN
-    False, so calling a string method on it raises AttributeError — out through
-    `load_settings`, past `handle_acp_delegate`, which catches only
-    ConfigurationError, and out of `acpx_is_available` too, which the registry
-    calls every turn. A malformed setting must degrade to the default, never
-    take the tool off the model's list.
-    """
-    if not isinstance(raw, str) or not raw.strip():
-        return DEFAULT_PERMISSION_MODE
-    return raw.strip()
 
 
 def resolve_working_directory(

@@ -128,23 +128,42 @@ It **fails open when the worker advertised nothing**. An empty list means the
 worker never said, which is not evidence it has no commands — pi may never send
 the event at all.
 
-## The worker runs in `auto` mode
+## The session mode belongs to the adapter, not to the config
 
-Each delegation opens a **named acpx session**, sets its mode, prompts, then
-closes it. The mode is the reason for the session — `exec` is one-shot and
-cannot carry one.
+Each delegation opens a **named acpx session**, sets its mode when the worker
+has one, prompts, then closes it. The mode is the reason for the session —
+`exec` is one-shot and cannot carry one.
 
-```yaml
-permission_mode: auto     # default; "default" restores prompt-everything
-```
+| Worker | Mode sent | Because |
+| --- | --- | --- |
+| `claude` | `auto` | `modeId` is a **permission** mode |
+| `pi` | *none* | `modeId` is pi's **thinking** level |
 
-Without it a review cannot run at all. Reviewing code means running `git`, `gh`
-and tests, which are the ACP `execute` kind, and the kind policy below denies
-`execute`. It has to: acpx matches **kinds, never paths**, so allowing "run
-git" there also allows "run anything, anywhere".
+This is a table in `config.py`, not a setting, and the tool schema has no
+parameter for it. `session/set_mode` is one ACP method carrying two unrelated
+vocabularies, so there is no value that is right for both adapters — and the
+cost of sending the wrong one is not a degraded run but a dead one.
 
-`auto` moves that judgement into the worker, whose classifier decides per action
-and mostly never asks acpx at all.
+**Claude needs `auto` or a review cannot run at all.** Reviewing code means
+running `git`, `gh` and tests, which are the ACP `execute` kind, and the kind
+policy below denies `execute`. It has to: acpx matches **kinds, never paths**,
+so allowing "run git" there also allows "run anything, anywhere". `auto` moves
+that judgement into the worker, whose classifier decides per action and mostly
+never asks acpx at all.
+
+**pi needs no mode, and rejects every one it is offered.** pi-acp's
+`setSessionMode` calls pi's `setThinkingLevel` and refuses anything outside
+`off|minimal|low|medium|high|xhigh`, so Claude's `auto` comes back
+`Invalid params` (ACP −32602) — which killed every pi delegation at session
+setup, before the worker ran a token. Nothing is lost by skipping it: pi ships
+no sandbox and no approval gate, and pi-acp never asks the client for permission
+to run a shell command, so the kind policy below is never consulted for pi
+either. It can already do what a review needs. Its thinking level is the
+worker's own configuration, not this plugin's business.
+
+Adding a worker means adding a row to that table, next to the reason. A worker
+with no row is sent no mode, because a borrowed one is at best meaningless to a
+new adapter and at worst fatal to every session it opens.
 
 **The two gates are sequential, not additive** — and that is the part that is
 easy to get backwards. A worker only asks acpx about what it did not settle
