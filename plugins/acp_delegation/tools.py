@@ -113,11 +113,6 @@ ACP_DELEGATE_SCHEMA = {
                     "operator has approved. The returned 'cwd' says where it actually ran."
                 ),
             },
-            "timeout_seconds": {
-                "type": "integer",
-                "minimum": config.MIN_TIMEOUT_SECONDS,
-                "description": "Wall-clock limit. Defaults to 900 and is clamped to the configured maximum.",
-            },
         },
         "required": ["worker", "task", "cwd"],
     },
@@ -213,7 +208,7 @@ def _validate(args: Dict[str, Any], settings: config.Settings) -> Dict[str, Any]
         "cwd": config.resolve_working_directory(
             args.get("cwd") or "", settings.allowed_cwd_roots, settings.project_markers
         ),
-        "timeout_seconds": settings.clamp_timeout(args.get("timeout_seconds")),
+        "timeout_seconds": config.TIMEOUT_SECONDS,
     }
 
 
