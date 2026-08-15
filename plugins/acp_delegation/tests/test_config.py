@@ -45,15 +45,25 @@ class LoadSettingsTests(unittest.TestCase):
         settings = config.load_settings(config_with(allowed_cwd_roots=["/tmp"]))
 
         self.assertEqual(settings.acpx_bin, "acpx")
-        self.assertEqual(settings.default_timeout_seconds, config.DEFAULT_TIMEOUT_SECONDS)
         self.assertEqual(settings.kind_policy["defaultAction"], "deny")
 
-    def test_ignores_a_nonsense_timeout_instead_of_crashing(self):
+    def test_ignores_a_timeout_an_operator_tries_to_configure(self):
+        """The wall clock is fixed in code, so config.yaml cannot lower it.
+
+        Asserted rather than assumed: the mini's config.yaml still carries a
+        `max_timeout_seconds` key from before, and a silent revival of it would
+        put the 30-minute guess back within reach.
+        """
         settings = config.load_settings(
-            config_with(allowed_cwd_roots=["/tmp"], default_timeout_seconds="soon")
+            config_with(
+                allowed_cwd_roots=["/tmp"],
+                default_timeout_seconds=60,
+                max_timeout_seconds=120,
+            )
         )
 
-        self.assertEqual(settings.default_timeout_seconds, config.DEFAULT_TIMEOUT_SECONDS)
+        self.assertFalse(hasattr(settings, "default_timeout_seconds"))
+        self.assertFalse(hasattr(settings, "max_timeout_seconds"))
 
     def test_ignores_roots_that_are_not_a_list(self):
         with self.assertRaises(config.ConfigurationError):
@@ -114,23 +124,15 @@ class PermissionModeTests(unittest.TestCase):
         self.assertIsNone(config.permission_mode_for(""))
 
 
-class ClampTimeoutTests(unittest.TestCase):
-    def setUp(self):
-        self.settings = config.load_settings(
-            config_with(allowed_cwd_roots=["/tmp"], max_timeout_seconds=1000)
-        )
+class FixedTimeoutTests(unittest.TestCase):
+    def test_every_delegation_gets_ninety_minutes(self):
+        """Pinned to the number, not to itself.
 
-    def test_uses_the_default_when_none_is_requested(self):
-        self.assertEqual(self.settings.clamp_timeout(None), config.DEFAULT_TIMEOUT_SECONDS)
-
-    def test_caps_a_request_above_the_maximum(self):
-        self.assertEqual(self.settings.clamp_timeout(99999), 1000)
-
-    def test_raises_a_request_below_the_minimum(self):
-        self.assertEqual(self.settings.clamp_timeout(1), config.MIN_TIMEOUT_SECONDS)
-
-    def test_keeps_a_request_inside_the_range(self):
-        self.assertEqual(self.settings.clamp_timeout(600), 600)
+        `assertEqual(TIMEOUT_SECONDS, TIMEOUT_SECONDS)` would pass at any value.
+        The point of the constant is that it is long enough for a fan-out review,
+        so the test states the duration a reader can check against reality.
+        """
+        self.assertEqual(config.TIMEOUT_SECONDS, 90 * 60)
 
 
 class ResolveWorkingDirectoryTests(unittest.TestCase):

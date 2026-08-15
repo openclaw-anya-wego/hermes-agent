@@ -18,7 +18,7 @@ REPO_ROOT = os.path.dirname(
 )
 sys.path.insert(0, REPO_ROOT)
 
-from plugins.acp_delegation import acpx_process, parse, tools  # noqa: E402
+from plugins.acp_delegation import acpx_process, config, parse, tools  # noqa: E402
 
 
 def outcome(text="done", exit_code=0, output_tokens=5, available_commands=None):
@@ -288,19 +288,29 @@ class SuccessTests(HandlerTestCase):
 
         self.assertIsNone(self.calls[0]["permission_mode"])
 
-    def test_clamps_an_absurd_timeout_before_spawning(self):
-        self.stub_run(outcome())
-
-        self.delegate(timeout_seconds=999999)
-
-        self.assertEqual(self.calls[0]["timeout_seconds"], 3600)
-
-    def test_applies_the_default_timeout_when_none_is_given(self):
+    def test_spawns_with_the_fixed_timeout(self):
         self.stub_run(outcome())
 
         self.delegate()
 
-        self.assertEqual(self.calls[0]["timeout_seconds"], 900)
+        self.assertEqual(self.calls[0]["timeout_seconds"], config.TIMEOUT_SECONDS)
+
+    def test_a_timeout_the_model_invents_is_ignored(self):
+        """The knob is gone from the schema, but a model can still emit the key.
+
+        It reached acpx verbatim before, which is how a 1800 s guess killed a
+        review that needed longer. Extra arguments are ignored, not honoured.
+        """
+        self.stub_run(outcome())
+
+        self.delegate(timeout_seconds=60)
+
+        self.assertEqual(self.calls[0]["timeout_seconds"], config.TIMEOUT_SECONDS)
+
+    def test_the_schema_offers_no_timeout_knob(self):
+        self.assertNotIn(
+            "timeout_seconds", tools.ACP_DELEGATE_SCHEMA["parameters"]["properties"]
+        )
 
 
 class FailureTests(HandlerTestCase):

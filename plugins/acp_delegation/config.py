@@ -12,7 +12,8 @@ Config lives under ``plugins.entries.acp_delegation`` in ``config.yaml``::
           allowed_cwd_roots:
             - /Users/wegoaiteam/working-repos
           acpx_bin: /Users/wegoaiteam/.local/node/bin/acpx
-          default_timeout_seconds: 900
+
+The wall-clock limit is deliberately not among them. See ``TIMEOUT_SECONDS``.
 """
 
 from __future__ import annotations
@@ -23,9 +24,21 @@ from typing import Any, Dict, List, Optional
 
 PLUGIN_ID = "acp_delegation"
 
-DEFAULT_TIMEOUT_SECONDS = 900
-MAX_TIMEOUT_SECONDS = 3600
-MIN_TIMEOUT_SECONDS = 30
+# Every delegation gets the same 90 minutes. Neither the model nor the operator
+# chooses it, because the choice was never informative: the caller cannot know
+# how long a review will take, and the only failure mode is asking for too
+# little. A run that finishes early costs nothing extra — acpx stops when the
+# worker stops, not when the clock runs out — so the sole effect of a smaller
+# number is killing work that would have succeeded.
+#
+# Guessing low is exactly what happened on wego-ai#1543: a 1800 s request died
+# at 30 min with three of four sub-reviews already written to disk. Worse, acpx
+# does not report that honestly. Its `runPromptTurn` swallows its own
+# TimeoutError whenever the worker has emitted anything at all, returns a
+# synthetic `end_turn`, sends no `session/cancel`, and exits 0 — so a timeout
+# reaches `parse.py` as `malformed_output`, "the output cannot be trusted",
+# and reads as a broken adapter rather than a short clock.
+TIMEOUT_SECONDS = 5400
 # Well above what a reply normally reaches. Hermes spills anything larger than
 # `max_result_size_chars` to a file and gives the model a path to read it, so a
 # low plugin-side cap would throw away what the host would have preserved.
@@ -125,16 +138,9 @@ class ConfigurationError(Exception):
 class Settings:
     allowed_cwd_roots: List[str]
     acpx_bin: str = "acpx"
-    default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
-    max_timeout_seconds: int = MAX_TIMEOUT_SECONDS
     max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS
     kind_policy: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_KIND_POLICY))
     project_markers: List[str] = field(default_factory=lambda: list(DEFAULT_PROJECT_MARKERS))
-
-    def clamp_timeout(self, requested: Optional[int]) -> int:
-        if not requested:
-            return self.default_timeout_seconds
-        return max(MIN_TIMEOUT_SECONDS, min(int(requested), self.max_timeout_seconds))
 
 
 def load_settings(hermes_config: Optional[Dict[str, Any]]) -> Settings:
@@ -157,10 +163,6 @@ def load_settings(hermes_config: Optional[Dict[str, Any]]) -> Settings:
     return Settings(
         allowed_cwd_roots=roots,
         acpx_bin=entry.get("acpx_bin") or "acpx",
-        default_timeout_seconds=_positive_int(
-            entry.get("default_timeout_seconds"), DEFAULT_TIMEOUT_SECONDS
-        ),
-        max_timeout_seconds=_positive_int(entry.get("max_timeout_seconds"), MAX_TIMEOUT_SECONDS),
         max_response_chars=_positive_int(
             entry.get("max_response_chars"), DEFAULT_MAX_RESPONSE_CHARS
         ),

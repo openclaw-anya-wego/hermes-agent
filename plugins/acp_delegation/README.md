@@ -39,8 +39,6 @@ plugins:
       allowed_cwd_roots:            # required — a task may only run inside these
         - /Users/wegoaiteam/working-repos
       acpx_bin: acpx                # absolute path if acpx is off PATH
-      default_timeout_seconds: 900
-      max_timeout_seconds: 3600
       max_response_chars: 100000
       project_markers:              # what makes a directory a project root
         - .git                      # default: .git, .hg, .svn
@@ -50,6 +48,12 @@ plugins:
         escalate: []
         defaultAction: deny
 ```
+
+The wall clock is not among these keys. Every delegation gets 90 minutes,
+fixed in `config.TIMEOUT_SECONDS`, and neither the model nor `config.yaml` can
+change it. A caller cannot know in advance how long a review takes, an early
+finish costs nothing, and the only reachable mistake is asking for too little —
+which acpx then reports as `malformed_output` rather than as a timeout.
 
 ## One root, many projects
 
